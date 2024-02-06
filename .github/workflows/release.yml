@@ -127,7 +127,7 @@ jobs:
           khulnasoft/edge-runtime@${{ needs.publish_x86.outputs.image_digest }} \
           khulnasoft/edge-runtime@${{ needs.publish_arm.outputs.image_digest }}
       - name: configure aws credentials
-        uses: aws-actions/configure-aws-credentials@v1
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.PROD_AWS_ROLE }}
           aws-region: us-east-1
