@@ -53,7 +53,7 @@ jobs:
           password: ${{ secrets.DOCKER_PASSWORD }}
 
       - id: build
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           push: true
           platforms: linux/${{ env.arch }}
@@ -96,7 +96,7 @@ jobs:
             network=host
 
       - id: build
-        uses: docker/build-push-action@v3
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
