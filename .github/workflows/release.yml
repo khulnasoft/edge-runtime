@@ -37,7 +37,7 @@ jobs:
       image_digest: ${{ steps.build.outputs.digest }}
     steps:
       - id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: |
             khulnasoft/edge-runtime
@@ -75,7 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - id: meta
-        uses: docker/metadata-action@v4
+        uses: docker/metadata-action@v5
         with:
           images: |
             khulnasoft/edge-runtime
