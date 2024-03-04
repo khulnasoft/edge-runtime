@@ -1,14 +1,17 @@
+use crate::inspector_server::Inspector;
 use crate::rt_worker::worker_ctx::{
     create_events_worker, create_main_worker, create_user_worker_pool, TerminationToken,
 };
 use crate::rt_worker::worker_pool::WorkerPoolPolicy;
+use crate::InspectorOption;
 use anyhow::Error;
 use event_worker::events::WorkerEventWithMetadata;
 use futures_util::Stream;
 use hyper::{server::conn::Http, service::Service, Body, Request, Response};
 use log::{debug, error, info};
 use sb_core::conn_sync::ConnSync;
-use sb_workers::context::WorkerRequestMsg;
+use sb_core::SharedMetricSource;
+use sb_workers::context::{MainWorkerRuntimeOpts, WorkerRequestMsg};
 use std::future::Future;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -18,9 +21,11 @@ use std::pin::Pin;
 use std::str;
 use std::str::FromStr;
 use std::task::Poll;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 pub enum ServerEvent {
@@ -57,15 +62,20 @@ impl<S: Stream + Unpin> Stream for NotifyOnEos<S> {
 }
 
 struct WorkerService {
+    metric_src: SharedMetricSource,
     worker_req_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
     cancel: CancellationToken,
 }
 
 impl WorkerService {
-    fn new(worker_req_tx: mpsc::UnboundedSender<WorkerRequestMsg>) -> (Self, CancellationToken) {
+    fn new(
+        metric_src: SharedMetricSource,
+        worker_req_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
+    ) -> (Self, CancellationToken) {
         let cancel = CancellationToken::new();
         (
             Self {
+                metric_src,
                 worker_req_tx,
                 cancel: cancel.clone(),
             },
@@ -86,6 +96,7 @@ impl Service<Request<Body>> for WorkerService {
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         // create a response in a future.
         let cancel = self.cancel.child_token();
+        let metric_src = self.metric_src.clone();
         let worker_req_tx = self.worker_req_tx.clone();
         let fut = async move {
             let (res_tx, res_rx) = oneshot::channel::<Result<Response<Body>, hyper::Error>>();
@@ -99,12 +110,16 @@ impl Service<Request<Body>> for WorkerService {
             };
 
             worker_req_tx.send(msg)?;
+            metric_src.incl_received_requests();
 
             tokio::spawn({
+                let metric_src_inner = metric_src.clone();
                 let cancel = cancel.clone();
+
                 async move {
                     tokio::select! {
                         _ = cancel.cancelled() => {
+                            metric_src_inner.incl_handled_requests();
                             if let Err(ex) = ob_conn_watch_tx.send(ConnSync::Recv) {
                                 error!("can't update connection watcher: {}", ex.to_string());
                             }
@@ -116,7 +131,15 @@ impl Service<Request<Body>> for WorkerService {
                 }
             });
 
-            let res = match res_rx.await? {
+            let res = match res_rx.await {
+                Ok(res) => res,
+                Err(err) => {
+                    metric_src.incl_handled_requests();
+                    return Err(err.into());
+                }
+            };
+
+            let res = match res {
                 Ok(res) => res,
                 Err(e) => {
                     error!(
@@ -141,7 +164,7 @@ impl Service<Request<Body>> for WorkerService {
                 parts,
                 Body::wrap_stream(NotifyOnEos {
                     inner: body,
-                    cancel: Some(cancel.clone()),
+                    cancel: Some(cancel),
                 }),
             );
 
@@ -158,12 +181,21 @@ pub struct WorkerEntrypoints {
     pub events: Option<String>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ServerFlags {
+    pub no_module_cache: bool,
+    pub allow_main_inspector: bool,
+    pub graceful_exit_deadline_sec: u64,
+}
+
 pub struct Server {
     ip: Ipv4Addr,
     port: u16,
     main_worker_req_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
     callback_tx: Option<Sender<ServerHealth>>,
     termination_token: TerminationToken,
+    flags: ServerFlags,
+    metric_src: SharedMetricSource,
 }
 
 impl Server {
@@ -175,38 +207,43 @@ impl Server {
         maybe_events_service_path: Option<String>,
         maybe_user_worker_policy: Option<WorkerPoolPolicy>,
         import_map_path: Option<String>,
-        no_module_cache: bool,
+        flags: ServerFlags,
         callback_tx: Option<Sender<ServerHealth>>,
         entrypoints: WorkerEntrypoints,
         termination_token: Option<TerminationToken>,
+        inspector: Option<Inspector>,
     ) -> Result<Self, Error> {
-        let mut worker_events_sender: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>> = None;
+        let mut worker_events_tx: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>> = None;
         let maybe_events_entrypoint = entrypoints.events;
         let maybe_main_entrypoint = entrypoints.main;
         let termination_token = termination_token.unwrap_or_default();
 
         // Create Event Worker
-        if let Some(events_service_path) = maybe_events_service_path {
+        let event_worker_metric_src = if let Some(events_service_path) = maybe_events_service_path {
             let events_path = Path::new(&events_service_path);
             let events_path_buf = events_path.to_path_buf();
 
-            let events_worker = create_events_worker(
+            let (event_worker_metric, sender) = create_events_worker(
                 events_path_buf,
                 import_map_path.clone(),
-                no_module_cache,
+                flags.no_module_cache,
                 maybe_events_entrypoint,
                 Some(termination_token.child_token()),
             )
             .await?;
 
-            worker_events_sender = Some(events_worker);
-        }
+            worker_events_tx = Some(sender);
+            Some(event_worker_metric)
+        } else {
+            None
+        };
 
         // Create a user worker pool
-        let user_worker_msgs_tx = create_user_worker_pool(
+        let (shared_metric_src, worker_pool_tx) = create_user_worker_pool(
             maybe_user_worker_policy.unwrap_or_default(),
-            worker_events_sender,
+            worker_events_tx,
             None,
+            inspector.clone(),
         )
         .await?;
 
@@ -215,20 +252,35 @@ impl Server {
         let main_worker_req_tx = create_main_worker(
             main_worker_path,
             import_map_path.clone(),
-            no_module_cache,
-            user_worker_msgs_tx,
+            flags.no_module_cache,
+            MainWorkerRuntimeOpts {
+                worker_pool_tx,
+                shared_metric_src: Some(shared_metric_src.clone()),
+                event_worker_metric_src,
+            },
             maybe_main_entrypoint,
             Some(termination_token.child_token()),
+            if flags.allow_main_inspector {
+                inspector.map(|it| Inspector {
+                    option: InspectorOption::Inspect(it.option.socket_addr()),
+                    server: it.server,
+                })
+            } else {
+                None
+            },
         )
         .await?;
 
         let ip = Ipv4Addr::from_str(ip)?;
+
         Ok(Self {
             ip,
             port,
             main_worker_req_tx,
             callback_tx,
             termination_token,
+            flags,
+            metric_src: shared_metric_src,
         })
     }
 
@@ -240,6 +292,7 @@ impl Server {
         let addr = SocketAddr::new(IpAddr::V4(self.ip), self.port);
         let listener = TcpListener::bind(&addr).await?;
         let termination_token = self.termination_token.clone();
+        let flags = self.flags;
 
         let mut can_receive_event = false;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -253,6 +306,7 @@ impl Server {
 
         loop {
             let main_worker_req_tx = self.main_worker_req_tx.clone();
+            let metric_src = self.metric_src.clone();
 
             tokio::select! {
                 msg = listener.accept() => {
@@ -261,11 +315,12 @@ impl Server {
                             tokio::task::spawn({
                                 let event_tx = event_tx.clone();
                                 async move {
-                                    let (service, cancel) = WorkerService::new(main_worker_req_tx);
+                                    let (service, cancel) = WorkerService::new(metric_src, main_worker_req_tx);
                                     let _guard = cancel.drop_guard();
 
                                     let conn_fut = Http::new()
-                                        .serve_connection(conn, service);
+                                        .serve_connection(conn, service)
+                                        .with_upgrades();
 
                                     if let Err(e) = conn_fut.await {
                                         // Most common cause for these errors are
@@ -300,6 +355,31 @@ impl Server {
                 }
             }
         }
+
+        let graceful_exit_deadline = flags.graceful_exit_deadline_sec;
+
+        if graceful_exit_deadline > 0 {
+            let timeout_fut = timeout(
+                Duration::from_secs(graceful_exit_deadline),
+                termination_token.cancel_and_wait(),
+            );
+
+            tokio::select! {
+                res = timeout_fut => {
+                    if res.is_err() {
+                        error!(
+                            "did not able to terminate the workers within {} seconds",
+                            graceful_exit_deadline,
+                        );
+                    }
+                }
+
+                _ = tokio::signal::ctrl_c() => {
+                    error!("received interrupt signal while waiting workers");
+                }
+            }
+        }
+
         Ok(())
     }
 }

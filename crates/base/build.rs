@@ -11,7 +11,9 @@ mod khulnasoft_startup_snapshot {
     use deno_http::DefaultHttpPropertyExtractor;
     use event_worker::js_interceptors::sb_events_js_interceptors;
     use event_worker::sb_user_event_worker;
-    use sb_core::http_start::sb_core_http;
+    use sb_ai::sb_ai;
+    use sb_core::http::sb_core_http;
+    use sb_core::http_start::sb_core_http_start;
     use sb_core::net::sb_core_net;
     use sb_core::permissions::sb_core_permissions;
     use sb_core::runtime::sb_core_runtime;
@@ -156,6 +158,14 @@ mod khulnasoft_startup_snapshot {
         fn check_sys(&self, _kind: &str, _api_name: &str) -> Result<(), AnyError> {
             unreachable!("snapshotting!")
         }
+
+        fn check_write_with_api_name(
+            &self,
+            _path: &Path,
+            _api_name: Option<&str>,
+        ) -> Result<(), AnyError> {
+            unreachable!("snapshotting!")
+        }
     }
 
     pub fn create_runtime_snapshot(snapshot_path: PathBuf) {
@@ -170,6 +180,8 @@ mod khulnasoft_startup_snapshot {
                 Arc::new(deno_web::BlobStore::default()),
                 None,
             ),
+            deno_webgpu::deno_webgpu::init_ops_and_esm(),
+            deno_canvas::deno_canvas::init_ops_and_esm(),
             deno_fetch::deno_fetch::init_ops_and_esm::<Permissions>(deno_fetch::Options {
                 user_agent: user_agent.clone(),
                 root_cert_store_provider: None,
@@ -186,6 +198,7 @@ mod khulnasoft_startup_snapshot {
             deno_http::deno_http::init_ops_and_esm::<DefaultHttpPropertyExtractor>(),
             deno_io::deno_io::init_ops_and_esm(Some(Default::default())),
             deno_fs::deno_fs::init_ops_and_esm::<Permissions>(fs.clone()),
+            sb_ai::init_ops_and_esm(),
             sb_env::init_ops_and_esm(),
             sb_os::sb_os::init_ops_and_esm(),
             sb_user_workers::init_ops_and_esm(),
@@ -194,6 +207,7 @@ mod khulnasoft_startup_snapshot {
             sb_core_main_js::init_ops_and_esm(),
             sb_core_net::init_ops_and_esm(),
             sb_core_http::init_ops_and_esm(),
+            sb_core_http_start::init_ops_and_esm(),
             deno_node::init_ops_and_esm::<Permissions>(None, fs),
             sb_core_runtime::init_ops_and_esm(None),
         ];

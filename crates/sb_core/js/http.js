@@ -1,13 +1,17 @@
-import { HttpConn } from 'ext:deno_http/01_http.js';
-import { RequestPrototype } from 'ext:deno_fetch/23_request.js';
+import "ext:deno_http/01_http.js";
+
 import { core, primordials } from "ext:core/mod.js";
+import { RequestPrototype } from "ext:deno_fetch/23_request.js";
+import { HttpConn, upgradeWebSocket } from "ext:sb_core_main_js/js/01_http.js";
+
+const { internalRidSymbol } = core;
 const { ObjectPrototypeIsPrototypeOf } = primordials;
 
 const HttpConnPrototypeNextRequest = HttpConn.prototype.nextRequest;
 const HttpConnPrototypeClose = HttpConn.prototype.close;
 const ops = core.ops;
 
-const watcher = Symbol("watcher");
+const kKhulnasoftTag = Symbol("kKhulnasoftTag");
 
 function internalServerError() {
 	// "Internal Server Error"
@@ -40,7 +44,7 @@ function internalServerError() {
 }
 
 function serveHttp(conn) {
-	const [connRid, watcherRid] = ops.op_http_start(conn.rid);
+	const [connRid, watcherRid] = ops.op_http_start(conn[internalRidSymbol]);
 	const httpConn = new HttpConn(connRid, conn.remoteAddr, conn.localAddr);
 
 	httpConn.nextRequest = async () => {
@@ -50,7 +54,10 @@ function serveHttp(conn) {
 			return null;
 		}
 
-		nextRequest.request[watcher] = watcherRid;
+		nextRequest.request[kKhulnasoftTag] = {
+			watcherRid,
+			streamRid: nextRequest.streamRid
+		};
 
 		return nextRequest;
 	};
@@ -74,17 +81,21 @@ async function serve(args1, args2) {
 
 	if (typeof args1 === 'function') {
 		opts['handler'] = args1;
-	} else if (typeof args1 === 'object' && typeof args2 === 'function') {
+	} else if (typeof args2 === 'function') {
 		opts['handler'] = args2;
-	} else if (typeof args1 === 'object') {
-		if (typeof args1['handler'] === 'function') {
-			opts['handler'] = args1['handler'];
-		}
+	} else if (typeof args1 === 'object' && typeof args1['handler'] === 'function') {
+		opts['handler'] = args1['handler'];
+	} else {
+		throw new TypeError('A handler function must be provided.');
+	}
+
+	if (typeof args1 === 'object') {
 		if (typeof args1['onListen'] === 'function') {
 			opts['onListen'] = args1['onListen'];
 		}
-	} else {
-		throw new TypeError('A handler function must be provided.');
+		if (typeof args1['onError'] === 'function') {
+			opts['onError'] = args1['onError'];
+		}
 	}
 
 	let serve;
@@ -103,6 +114,15 @@ async function serve(args1, args2) {
 
 				e.respondWith(res);
 			} catch (error) {
+				if (opts['onError'] !== void 0) {
+					try {
+						const res = await opts['onError'](error);
+						return e.respondWith(res);
+					} catch(error2) {
+						error = error2;
+					}
+				}
+
 				console.error(error);
 				return e.respondWith(internalServerError());
 			}
@@ -136,19 +156,25 @@ async function serve(args1, args2) {
 	};
 }
 
-function getWatcherRid(req) {
-	return req[watcher];
+function getKhulnasoftTag(req) {
+	return req[kKhulnasoftTag];
 }
 
-function applyWatcherRid(src, dest) {
+function applyKhulnasoftTag(src, dest) {
 	if (
 		!ObjectPrototypeIsPrototypeOf(RequestPrototype, src) 
 		|| !ObjectPrototypeIsPrototypeOf(RequestPrototype, dest)
 	) {
-		throw new TypeError("Only Request instance can apply the connection watcher");
+		throw new TypeError("Only Request instance can apply the khulnasoft tag");
 	}
 
-	dest[watcher] = src[watcher];
+	dest[kKhulnasoftTag] = src[kKhulnasoftTag];
 }
 
-export { serve, serveHttp, getWatcherRid, applyWatcherRid };
+export { 
+	serve,
+	serveHttp,
+	getKhulnasoftTag,
+	applyKhulnasoftTag,
+	upgradeWebSocket
+};

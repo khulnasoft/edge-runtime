@@ -14,6 +14,33 @@ serve(async (req: Request) => {
 		);
 	}
 
+	if (pathname === '/_internal/metric') {
+		const metric = await EdgeRuntime.getRuntimeMetrics();
+		return Response.json(metric);
+	}
+
+	// NOTE: You can test WebSocket in the main worker by uncommenting below.
+	// if (pathname === '/_internal/ws') {
+	// 	const upgrade = req.headers.get("upgrade") || "";
+
+	// 	if (upgrade.toLowerCase() != "websocket") {
+	// 		return new Response("request isn't trying to upgrade to websocket.");
+	// 	}
+	
+	// 	const { socket, response } = Deno.upgradeWebSocket(req);
+	
+	// 	socket.onopen = () => console.log("socket opened");
+	// 	socket.onmessage = (e) => {
+	// 		console.log("socket message:", e.data);
+	// 		socket.send(new Date().toString());
+	// 	};
+	
+	// 	socket.onerror = e => console.log("socket errored:", e.message);
+	// 	socket.onclose = () => console.log("socket closed");
+	
+	// 	return response; // 101 (Switching Protocols)
+	// }
+
 	const path_parts = pathname.split('/');
 	const service_name = path_parts[1];
 
@@ -32,6 +59,7 @@ serve(async (req: Request) => {
 		const memoryLimitMb = 150;
 		const workerTimeoutMs = 5 * 60 * 1000;
 		const noModuleCache = false;
+
 		// you can provide an import map inline
 		// const inlineImportMap = {
 		//   imports: {
@@ -54,8 +82,8 @@ serve(async (req: Request) => {
 		// or load module source from an inline module
 		// const maybeModuleCode = 'Deno.serve((req) => new Response("Hello from Module Code"));';
 		//
-		const cpuTimeSoftLimitMs = 50;
-		const cpuTimeHardLimitMs = 100;
+		const cpuTimeSoftLimitMs = 10000;
+		const cpuTimeHardLimitMs = 20000;
 
 		return await EdgeRuntime.userWorkers.create({
 			servicePath,
@@ -89,7 +117,7 @@ serve(async (req: Request) => {
 			return await worker.fetch(req, { signal });
 		} catch (e) {
 			console.error(e);
-			
+
 			if (e instanceof Deno.errors.WorkerRequestCancelled) {
 				// XXX(Nyannyacha): I can't think right now how to re-poll
 				// inside the worker pool without exposing the error to the
@@ -103,7 +131,7 @@ serve(async (req: Request) => {
 				// some internal reasons. We should repoll the worker and call
 				// `fetch` again.
 				// return await callWorker();
-				console.log("cancelled!");
+				console.log('cancelled!');
 			}
 
 			const error = { msg: e.toString() };

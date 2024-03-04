@@ -9,7 +9,7 @@ use sb_workers::context::{Timing, TimingStatus, UserWorkerMsgs};
 use tokio::time::Instant;
 
 use crate::rt_worker::supervisor::{
-    handle_interrupt, wait_cpu_alarm, CPUUsage, CPUUsageMetrics, IsolateInterruptData,
+    handle_interrupt, wait_cpu_alarm, CPUUsage, CPUUsageMetrics, IsolateInterruptData, Tokens,
 };
 
 use super::Arguments;
@@ -26,7 +26,10 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
         pool_msg_tx,
         isolate_memory_usage_tx,
         thread_safe_handle,
-        termination_token,
+        tokens: Tokens {
+            termination,
+            supervise,
+        },
         ..
     } = args;
 
@@ -62,8 +65,12 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
 
     loop {
         tokio::select! {
+            _ = supervise.cancelled() => {
+                return (ShutdownReason::TerminationRequested, cpu_usage_ms);
+            }
+
             _ = async {
-                match termination_token.as_ref() {
+                match termination.as_ref() {
                     Some(token) => token.inbound.cancelled().await,
                     None => pending().await,
                 }
@@ -185,13 +192,17 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
 
             Some(reason) => {
                 is_retired.raise();
-                thread_safe_handle.request_interrupt(
-                    handle_interrupt,
-                    Box::into_raw(Box::new(IsolateInterruptData {
-                        should_terminate: true,
-                        isolate_memory_usage_tx: Some(isolate_memory_usage_tx),
-                    })) as *mut std::ffi::c_void,
-                );
+
+                let data_ptr_mut = Box::into_raw(Box::new(IsolateInterruptData {
+                    should_terminate: true,
+                    isolate_memory_usage_tx: Some(isolate_memory_usage_tx),
+                }));
+
+                if !thread_safe_handle
+                    .request_interrupt(handle_interrupt, data_ptr_mut as *mut std::ffi::c_void)
+                {
+                    drop(unsafe { Box::from_raw(data_ptr_mut) });
+                }
 
                 return (reason, cpu_usage_accumulated_ms);
             }

@@ -2,7 +2,7 @@ import * as abortSignal from 'ext:deno_web/03_abort_signal.js';
 import * as base64 from 'ext:deno_web/05_base64.js';
 import * as console from 'ext:deno_console/01_console.js';
 import * as crypto from 'ext:deno_crypto/00_crypto.js';
-import { DOMException } from "ext:deno_web/01_dom_exception.js";
+import { DOMException } from 'ext:deno_web/01_dom_exception.js';
 import * as encoding from 'ext:deno_web/08_text_encoding.js';
 import * as event from 'ext:deno_web/02_event.js';
 import * as fetch from 'ext:deno_fetch/26_fetch.js';
@@ -20,6 +20,7 @@ import * as response from 'ext:deno_fetch/23_response.js';
 import * as request from 'ext:deno_fetch/23_request.js';
 import * as globalInterfaces from 'ext:deno_web/04_global_interfaces.js';
 import { KHULNASOFT_ENV } from 'ext:sb_env/env.js';
+import ai from 'ext:sb_ai/ai.js';
 import { registerErrors } from 'ext:sb_core_main_js/js/errors.js';
 import {
 	formatException,
@@ -42,20 +43,83 @@ import * as messagePort from 'ext:deno_web/13_message_port.js';
 import { KhulnasoftEventListener } from 'ext:sb_user_event_worker/event_worker.js';
 import * as MainWorker from 'ext:sb_core_main_js/js/main_worker.js';
 import * as DenoWebCompression from 'ext:deno_web/14_compression.js';
-import * as imageData from "ext:deno_web/16_image_data.js";
 import * as DenoWSStream from 'ext:deno_websocket/02_websocketstream.js';
-import * as eventSource from "ext:deno_fetch/27_eventsource.js";
-import { primordials, core } from "ext:core/mod.js";
-const ops = core.ops;
+import * as eventSource from 'ext:deno_fetch/27_eventsource.js';
+import * as WebGPU from 'ext:deno_webgpu/00_init.js';
+import * as WebGPUSurface from 'ext:deno_webgpu/02_surface.js';
 
+import { core, internals, primordials } from 'ext:core/mod.js';
+import { op_lazy_load_esm } from 'ext:core/ops';
+
+const ops = core.ops;
 const {
 	Error,
+	ArrayPrototypePop,
+	ArrayPrototypeShift,
+	ObjectAssign,
 	ObjectDefineProperty,
 	ObjectDefineProperties,
 	ObjectSetPrototypeOf,
-	ObjectFreeze,
+	SafeSet,
+	StringPrototypeIncludes,
 	StringPrototypeSplit,
+	StringPrototypeTrim
 } = primordials;
+
+let image;
+function ImageNonEnumerable(getter) {
+	let valueIsSet = false;
+	let value;
+
+	return {
+		get() {
+			loadImage();
+
+			if (valueIsSet) {
+				return value;
+			} else {
+				return getter();
+			}
+		},
+		set(v) {
+			loadImage();
+
+			valueIsSet = true;
+			value = v;
+		},
+		enumerable: false,
+		configurable: true,
+	};
+}
+function ImageWritable(getter) {
+	let valueIsSet = false;
+	let value;
+
+	return {
+		get() {
+			loadImage();
+
+			if (valueIsSet) {
+				return value;
+			} else {
+				return getter();
+			}
+		},
+		set(v) {
+			loadImage();
+
+			valueIsSet = true;
+			value = v;
+		},
+		enumerable: true,
+		configurable: true,
+	};
+}
+function loadImage() {
+	if (!image) {
+		image = op_lazy_load_esm('ext:deno_canvas/01_image.js');
+	}
+}
 
 const globalScope = {
 	console: nonEnumerable(
@@ -72,7 +136,6 @@ const globalScope = {
 	Request: nonEnumerable(request.Request),
 	Response: nonEnumerable(response.Response),
 	Headers: nonEnumerable(headers.Headers),
-	ImageData: nonEnumerable(imageData.ImageData),
 	fetch: writable(fetch.fetch),
 
 	// base64
@@ -155,6 +218,11 @@ const globalScope = {
 	AbortController: nonEnumerable(abortSignal.AbortController),
 	AbortSignal: nonEnumerable(abortSignal.AbortSignal),
 
+	// Image
+	ImageData: ImageNonEnumerable(() => image.ImageData),
+	ImageBitmap: ImageNonEnumerable(() => image.ImageBitmap),
+	createImageBitmap: ImageWritable(() => image.createImageBitmap),
+
 	// web sockets
 	WebSocket: nonEnumerable(webSocket.WebSocket),
 
@@ -172,38 +240,111 @@ const globalScope = {
 	[webidl.brand]: nonEnumerable(webidl.brand),
 };
 
-// set build info
-const build = {
-	target: 'unknown',
-	arch: 'unknown',
-	os: 'unknown',
-	vendor: 'unknown',
-	env: undefined,
-};
+let verboseDeprecatedApiWarning = false;
+let deprecatedApiWarningDisabled = false;
+const ALREADY_WARNED_DEPRECATED = new SafeSet();
 
-function setBuildInfo(target) {
-	const { 0: arch, 1: vendor, 2: os, 3: env } = StringPrototypeSplit(
-		target,
-		'-',
-		4,
+function warnOnDeprecatedApi(apiName, stack, ...suggestions) {
+	if (deprecatedApiWarningDisabled) {
+		return;
+	}
+
+	if (!verboseDeprecatedApiWarning) {
+		if (ALREADY_WARNED_DEPRECATED.has(apiName)) {
+			return;
+		}
+		ALREADY_WARNED_DEPRECATED.add(apiName);
+		globalThis.console.error(
+			`%cwarning: %cUse of deprecated "${apiName}" API. This API will be removed in Deno 2. Run again with DENO_VERBOSE_WARNINGS=1 to get more details.`,
+			"color: yellow;",
+			"font-weight: bold;",
+		);
+		return;
+	}
+
+	if (ALREADY_WARNED_DEPRECATED.has(apiName + stack)) {
+		return;
+	}
+
+	// If we haven't warned yet, let's do some processing of the stack trace
+	// to make it more useful.
+	const stackLines = StringPrototypeSplit(stack, "\n");
+	ArrayPrototypeShift(stackLines);
+	while (stackLines.length > 0) {
+		// Filter out internal frames at the top of the stack - they are not useful
+		// to the user.
+		if (
+			StringPrototypeIncludes(stackLines[0], "(ext:") ||
+			StringPrototypeIncludes(stackLines[0], "(node:") ||
+			StringPrototypeIncludes(stackLines[0], "<anonymous>")
+		) {
+			ArrayPrototypeShift(stackLines);
+		} else {
+			break;
+		}
+	}
+	// Now remove the last frame if it's coming from "ext:core" - this is most likely
+	// event loop tick or promise handler calling a user function - again not
+	// useful to the user.
+	if (
+		stackLines.length > 0 &&
+		StringPrototypeIncludes(stackLines[stackLines.length - 1], "(ext:core/")
+	) {
+		ArrayPrototypePop(stackLines);
+	}
+
+	let isFromRemoteDependency = false;
+	const firstStackLine = stackLines[0];
+	if (firstStackLine && !StringPrototypeIncludes(firstStackLine, "file:")) {
+		isFromRemoteDependency = true;
+	}
+
+	ALREADY_WARNED_DEPRECATED.add(apiName + stack);
+	globalThis.console.error(
+		`%cwarning: %cUse of deprecated "${apiName}" API. This API will be removed in Deno 2.`,
+		"color: yellow;",
+		"font-weight: bold;",
 	);
-	build.target = target;
-	build.arch = arch;
-	build.vendor = vendor;
-	build.os = os;
-	build.env = env;
 
-	ObjectFreeze(build);
+	globalThis.console.error();
+	globalThis.console.error(
+		"See the Deno 1 to 2 Migration Guide for more information at https://docs.deno.com/runtime/manual/advanced/migrate_deprecations",
+	);
+	globalThis.console.error();
+	if (stackLines.length > 0) {
+		globalThis.console.error("Stack trace:");
+		for (let i = 0; i < stackLines.length; i++) {
+			globalThis.console.error(`  ${StringPrototypeTrim(stackLines[i])}`);
+		}
+		globalThis.console.error();
+	}
+
+	for (let i = 0; i < suggestions.length; i++) {
+		const suggestion = suggestions[i];
+		globalThis.console.error(
+			`%chint: ${suggestion}`,
+			"font-weight: bold;",
+		);
+	}
+
+	if (isFromRemoteDependency) {
+		globalThis.console.error(
+			`%chint: It appears this API is used by a remote dependency. Try upgrading to the latest version of that dependency.`,
+			"font-weight: bold;",
+		);
+	}
+	globalThis.console.error();
 }
+ObjectAssign(internals, { warnOnDeprecatedApi });
 
-function runtimeStart(runtimeOptions, source) {
+function runtimeStart(target) {
 	core.setMacrotaskCallback(timers.handleTimerMacrotask);
 	core.setMacrotaskCallback(promiseRejectMacrotaskCallback);
 	core.setWasmStreamingCallback(fetch.handleWasmStreaming);
 
 	ops.op_set_format_exception_callback(formatException);
 
-	setBuildInfo(runtimeOptions.target);
+	core.setBuildInfo(target);
 
 	// deno-lint-ignore prefer-primordials
 	Error.prepareStackTrace = core.prepareStackTrace;
@@ -233,7 +374,7 @@ const deleteDenoApis = (apis) => {
 	});
 };
 
-globalThis.bootstrapSBEdge = (opts, isUserWorker, isEventsWorker, edgeRuntimeVersion, denoVersion) => {
+globalThis.bootstrapSBEdge = opts => {
 	// We should delete this after initialization,
 	// Deleting it during bootstrapping can backfire
 	delete globalThis.__bootstrap;
@@ -246,27 +387,34 @@ globalThis.bootstrapSBEdge = (opts, isUserWorker, isEventsWorker, edgeRuntimeVer
 	const eventHandlers = ['error', 'load', 'beforeunload', 'unload', 'unhandledrejection'];
 	eventHandlers.forEach((handlerName) => event.defineEventHandler(globalThis, handlerName));
 
-	runtimeStart({
-		denoVersion: 'NA',
-		v8Version: 'NA',
-		tsVersion: 'NA',
-		noColor: true,
-		isTty: false,
-		...opts,
-	});
+	const {
+		0: target,
+		1: isUserWorker,
+		2: isEventsWorker,
+		3: edgeRuntimeVersion,
+		4: denoVersion,
+		5: shouldDisableDeprecatedApiWarning,
+		6: shouldUseVerboseDeprecatedApiWarning
+	} = opts;
+
+	deprecatedApiWarningDisabled = shouldDisableDeprecatedApiWarning;
+	verboseDeprecatedApiWarning = shouldUseVerboseDeprecatedApiWarning;
+
+	runtimeStart(target);
 
 	ObjectDefineProperty(globalThis, 'KHULNASOFT_VERSION', readOnly(String(edgeRuntimeVersion)));
-	ObjectDefineProperty(globalThis, 'DENO_VERSION', readOnly(denoVersion))
+	ObjectDefineProperty(globalThis, 'DENO_VERSION', readOnly(denoVersion));
 
 	// set these overrides after runtimeStart
 	ObjectDefineProperties(denoOverrides, {
-		build: readOnly(build),
+		build: readOnly(core.build),
 		env: readOnly(KHULNASOFT_ENV),
 		pid: readOnly(globalThis.__pid),
 		args: readOnly([]), // args are set to be empty
 		mainModule: getterOnly(() => ops.op_main_module()),
 		version: getterOnly(() => ({
-			deno: `khulnasoft-edge-runtime-${globalThis.KHULNASOFT_VERSION} (compatible with Deno v${globalThis.DENO_VERSION})`,
+			deno:
+				`khulnasoft-edge-runtime-${globalThis.KHULNASOFT_VERSION} (compatible with Deno v${globalThis.DENO_VERSION})`,
 			v8: '11.6.189.12',
 			typescript: '5.1.6',
 		})),
@@ -274,8 +422,18 @@ globalThis.bootstrapSBEdge = (opts, isUserWorker, isEventsWorker, edgeRuntimeVer
 	ObjectDefineProperty(globalThis, 'Deno', readOnly(denoOverrides));
 
 	setNumCpus(1); // explicitly setting no of CPUs to 1 (since we don't allow workers)
-	setUserAgent('Khulnasoft Edge Runtime');
+	setUserAgent(
+		`Deno/${globalThis.DENO_VERSION} (variant; KhulnasoftEdgeRuntime/${globalThis.KHULNASOFT_VERSION})`,
+	);
 	setLanguage('en');
+
+	Object.defineProperty(globalThis, 'Khulnasoft_UNSTABLE', {
+		get() {
+			return {
+				ai,
+			};
+		},
+	});
 
 	if (isUserWorker) {
 		delete globalThis.EdgeRuntime;
@@ -302,7 +460,7 @@ globalThis.bootstrapSBEdge = (opts, isUserWorker, isEventsWorker, edgeRuntimeVer
 	}
 
 	const nodeBootstrap = globalThis.nodeBootstrap;
-	if(nodeBootstrap) {
+	if (nodeBootstrap) {
 		nodeBootstrap(false, undefined);
 		delete globalThis.nodeBootstrap;
 	}
