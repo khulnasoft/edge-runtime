@@ -29,6 +29,9 @@ import {
 	readOnly,
 	writable,
 } from 'ext:sb_core_main_js/js/fieldUtils.js';
+import * as imageData from "ext:deno_web/16_image_data.js";
+import * as broadcastChannel from "ext:deno_broadcast_channel/01_broadcast_channel.js";
+
 import {
 	Navigator,
 	navigator,
@@ -36,6 +39,7 @@ import {
 	setNumCpus,
 	setUserAgent,
 } from 'ext:sb_core_main_js/js/navigator.js';
+
 import { promiseRejectMacrotaskCallback } from 'ext:sb_core_main_js/js/promises.js';
 import { denoOverrides, fsVars } from 'ext:sb_core_main_js/js/denoOverrides.js';
 import * as performance from 'ext:deno_web/15_performance.js';
@@ -49,7 +53,8 @@ import * as WebGPU from 'ext:deno_webgpu/00_init.js';
 import * as WebGPUSurface from 'ext:deno_webgpu/02_surface.js';
 
 import { core, internals, primordials } from 'ext:core/mod.js';
-import { op_lazy_load_esm } from 'ext:core/ops';
+
+let globalThis_;
 
 const ops = core.ops;
 const {
@@ -57,6 +62,7 @@ const {
 	ArrayPrototypePop,
 	ArrayPrototypeShift,
 	ObjectAssign,
+	ObjectKeys,
 	ObjectDefineProperty,
 	ObjectDefineProperties,
 	ObjectSetPrototypeOf,
@@ -117,7 +123,7 @@ function ImageWritable(getter) {
 }
 function loadImage() {
 	if (!image) {
-		image = op_lazy_load_esm('ext:deno_canvas/01_image.js');
+		image = ops.op_lazy_load_esm('ext:deno_canvas/01_image.js');
 	}
 }
 
@@ -338,8 +344,8 @@ function warnOnDeprecatedApi(apiName, stack, ...suggestions) {
 ObjectAssign(internals, { warnOnDeprecatedApi });
 
 function runtimeStart(target) {
-	core.setMacrotaskCallback(timers.handleTimerMacrotask);
-	core.setMacrotaskCallback(promiseRejectMacrotaskCallback);
+/*	core.setMacrotaskCallback(timers.handleTimerMacrotask);
+	core.setMacrotaskCallback(promiseRejectMacrotaskCallback);*/
 	core.setWasmStreamingCallback(fetch.handleWasmStreaming);
 
 	ops.op_set_format_exception_callback(formatException);
@@ -368,13 +374,51 @@ const globalProperties = {
 };
 ObjectDefineProperties(globalThis, globalProperties);
 
-const deleteDenoApis = (apis) => {
-	apis.forEach((key) => {
-		delete Deno[key];
-	});
+
+let bootstrapMockFnThrowError = false;
+const MOCK_FN = () => {
+	if (bootstrapMockFnThrowError) {
+		throw new TypeError("called MOCK_FN");
+	}	
 };
 
-globalThis.bootstrapSBEdge = opts => {
+const MAKE_HARD_ERR_FN = msg => {
+	return () => {
+		throw new globalThis_.Deno.errors.PermissionDenied(msg);
+	};
+};
+
+const DENIED_DENO_FS_API_LIST = ObjectKeys(fsVars)
+	.reduce(
+		(acc, it) => {
+			acc[it] = MAKE_HARD_ERR_FN(`Deno.${it} is blocklisted`);
+			return acc;
+		},
+		{}
+	);
+
+const PATCH_DENO_API_LIST = {
+	...DENIED_DENO_FS_API_LIST,
+
+	'cwd': true,
+	'readFile': true,
+	'readFileSync': true,
+	'readTextFile': true,
+	'readTextFileSync': true,
+
+	'kill': MOCK_FN,
+	'exit': MOCK_FN,
+	'addSignalListener': MOCK_FN,
+	'removeSignalListener': MOCK_FN,
+
+	// TODO: use a non-hardcoded path
+	'execPath': () => '/bin/edge-runtime',
+	'memoryUsage': () => ops.op_runtime_memory_usage(),
+};
+
+globalThis.bootstrapSBEdge = (opts, extraCtx) => {
+	globalThis_ = globalThis;
+
 	// We should delete this after initialization,
 	// Deleting it during bootstrapping can backfire
 	delete globalThis.__bootstrap;
@@ -399,6 +443,7 @@ globalThis.bootstrapSBEdge = opts => {
 
 	deprecatedApiWarningDisabled = shouldDisableDeprecatedApiWarning;
 	verboseDeprecatedApiWarning = shouldUseVerboseDeprecatedApiWarning;
+	bootstrapMockFnThrowError = extraCtx?.shouldBootstrapMockFnThrowError ?? false;
 
 	runtimeStart(target);
 
@@ -414,6 +459,7 @@ globalThis.bootstrapSBEdge = opts => {
 		mainModule: getterOnly(() => ops.op_main_module()),
 		version: getterOnly(() => ({
 			deno:
+				// TODO: It should be changed to a well-known name for the ecosystem.
 				`khulnasoft-edge-runtime-${globalThis.KHULNASOFT_VERSION} (compatible with Deno v${globalThis.DENO_VERSION})`,
 			v8: '11.6.189.12',
 			typescript: '5.1.6',
@@ -423,17 +469,55 @@ globalThis.bootstrapSBEdge = opts => {
 
 	setNumCpus(1); // explicitly setting no of CPUs to 1 (since we don't allow workers)
 	setUserAgent(
+		// TODO: It should be changed to a well-known name for the ecosystem.
 		`Deno/${globalThis.DENO_VERSION} (variant; KhulnasoftEdgeRuntime/${globalThis.KHULNASOFT_VERSION})`,
 	);
 	setLanguage('en');
 
-	Object.defineProperty(globalThis, 'Khulnasoft_UNSTABLE', {
+	Object.defineProperty(globalThis, 'Khulnasoft', {
 		get() {
 			return {
 				ai,
 			};
 		},
 	});
+
+	/// DISABLE SHARED MEMORY AND INSTALL MEM CHECK TIMING
+	
+	// NOTE: We should not allow user workers to use shared memory. This is
+	// because they are not counted in the external memory statistics of the
+	// individual isolates.
+
+	// NOTE(Nyannyacha): Put below inside `isUserWorker` block if we have the
+	// plan to support a shared array buffer across the isolates. But for now,
+	// we explicitly disabled the shared buffer option between isolate globally
+	// in `deno_runtime.rs`, so this patch also applies regardless of worker
+	// type.
+	const wasmMemoryCtor = globalThis.WebAssembly.Memory;
+	const wasmMemoryPrototypeGrow = wasmMemoryCtor.prototype.grow;
+
+	function patchedWasmMemoryPrototypeGrow(delta) {
+		let mem = wasmMemoryPrototypeGrow.call(this, delta); 
+
+		ops.op_schedule_mem_check();
+
+		return mem;
+	}
+
+	wasmMemoryCtor.prototype.grow = patchedWasmMemoryPrototypeGrow;
+	
+	function patchedWasmMemoryCtor(maybeOpts) {
+		if (typeof maybeOpts === "object" && maybeOpts["shared"] === true) {
+			throw new TypeError("Creating a shared memory is not supported");
+		}
+
+		return new wasmMemoryCtor(maybeOpts);
+	}
+
+	delete globalThis.SharedArrayBuffer;
+	globalThis.WebAssembly.Memory = patchedWasmMemoryCtor;
+
+	/// DISABLE SHARED MEMORY INSTALL MEM CHECK TIMING
 
 	if (isUserWorker) {
 		delete globalThis.EdgeRuntime;
@@ -446,9 +530,18 @@ globalThis.bootstrapSBEdge = opts => {
 				}),
 			),
 		});
+	
+		const apiNames = ObjectKeys(PATCH_DENO_API_LIST);
 
-		// remove all fs APIs except Deno.cwd
-		deleteDenoApis(Object.keys(fsVars).filter((k) => k !== 'cwd'));
+		for (const name of apiNames) {
+			const value = PATCH_DENO_API_LIST[name];
+
+			if (value === false) {
+				delete Deno[name]; 
+			} else if (typeof value === 'function') {
+				Deno[name] = value;
+			}
+		}
 	}
 
 	if (isEventsWorker) {

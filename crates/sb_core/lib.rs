@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use deno_core::error::AnyError;
-use deno_core::v8::IsolateHandle;
+use deno_core::v8;
 use deno_core::OpState;
 use deno_core::{op2, JsRuntime};
 use enum_as_inner::EnumAsInner;
@@ -13,6 +13,8 @@ use futures::FutureExt;
 use log::error;
 use serde::Serialize;
 use tokio::sync::oneshot;
+
+mod upgrade;
 
 pub mod auth_tokens;
 pub mod cache;
@@ -30,15 +32,36 @@ pub mod runtime;
 pub mod transpiler;
 pub mod util;
 
+pub struct MemCheckWaker(Arc<AtomicWaker>);
+
+impl From<Arc<AtomicWaker>> for MemCheckWaker {
+    fn from(value: Arc<AtomicWaker>) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SharedMetricSource {
     active_user_workers: Arc<AtomicUsize>,
     retired_user_workers: Arc<AtomicUsize>,
     received_requests: Arc<AtomicUsize>,
     handled_requests: Arc<AtomicUsize>,
+    active_io: Arc<AtomicUsize>,
 }
 
 impl SharedMetricSource {
+    pub fn active_io(&self) -> usize {
+        self.active_io.load(Ordering::Relaxed)
+    }
+
+    pub fn received_requests(&self) -> usize {
+        self.received_requests.load(Ordering::Relaxed)
+    }
+
+    pub fn handled_requests(&self) -> usize {
+        self.handled_requests.load(Ordering::Relaxed)
+    }
+
     pub fn incl_active_user_workers(&self) {
         self.active_user_workers.fetch_add(1, Ordering::Relaxed);
     }
@@ -59,11 +82,20 @@ impl SharedMetricSource {
         self.handled_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn incl_active_io(&self) {
+        self.active_io.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn decl_active_io(&self) {
+        self.active_io.fetch_sub(1, Ordering::Relaxed);
+    }
+
     pub fn reset(&self) {
         self.active_user_workers.store(0, Ordering::Relaxed);
         self.retired_user_workers.store(0, Ordering::Relaxed);
         self.received_requests.store(0, Ordering::Relaxed);
         self.handled_requests.store(0, Ordering::Relaxed);
+        self.active_io.store(0, Ordering::Relaxed);
     }
 }
 
@@ -75,7 +107,7 @@ pub enum MetricSource {
 
 #[derive(Debug, Clone)]
 pub struct WorkerMetricSource {
-    handle: IsolateHandle,
+    handle: v8::IsolateHandle,
     waker: Arc<AtomicWaker>,
 }
 
@@ -125,12 +157,9 @@ impl RuntimeMetricSource {
             heap_tx: oneshot::Sender<WorkerHeapStatistics>,
         }
 
-        extern "C" fn interrupt_fn(
-            isolate: &mut deno_core::v8::Isolate,
-            data: *mut std::ffi::c_void,
-        ) {
+        extern "C" fn interrupt_fn(isolate: &mut v8::Isolate, data: *mut std::ffi::c_void) {
             let arg = unsafe { Box::<InterruptData>::from_raw(data as *mut _) };
-            let mut v8_heap_stats = deno_core::v8::HeapStatistics::default();
+            let mut v8_heap_stats = v8::HeapStatistics::default();
             let mut worker_heap_stats = WorkerHeapStatistics::default();
 
             isolate.get_heap_statistics(&mut v8_heap_stats);
@@ -236,12 +265,12 @@ struct RuntimeMetrics {
     #[serde(flatten)]
     shared_stats: RuntimeSharedStatistics,
 }
-
+/*
 #[op2(fast)]
 fn op_is_terminal(state: &mut OpState, rid: u32) -> Result<bool, AnyError> {
     let handle = state.resource_table.get_handle(rid)?;
     Ok(handle.is_terminal())
-}
+}*/
 
 #[op2(fast)]
 fn op_stdin_set_raw(_state: &mut OpState, _is_raw: bool, _cbreak: bool) -> Result<(), AnyError> {
@@ -269,6 +298,40 @@ async fn op_runtime_metrics(state: Rc<RefCell<OpState>>) -> Result<RuntimeMetric
     Ok(runtime_metrics)
 }
 
+#[op2(fast)]
+fn op_schedule_mem_check(state: &mut OpState) -> Result<(), AnyError> {
+    if let Some(waker) = state.try_borrow::<MemCheckWaker>() {
+        waker.0.wake();
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryUsage {
+    rss: usize,
+    heap_total: usize,
+    heap_used: usize,
+    external: usize,
+}
+
+#[op2]
+#[serde]
+fn op_runtime_memory_usage(scope: &mut v8::HandleScope) -> MemoryUsage {
+    let mut s = v8::HeapStatistics::default();
+
+    scope.get_heap_statistics(&mut s);
+
+    MemoryUsage {
+        // NOTE: Hardcoded for security.
+        rss: 0,
+        heap_total: s.total_heap_size(),
+        heap_used: s.used_heap_size(),
+        external: s.external_memory(),
+    }
+}
+
 #[op2]
 #[string]
 pub fn op_read_line_prompt(
@@ -283,15 +346,35 @@ fn op_set_exit_code(_state: &mut OpState, #[smi] _code: i32) -> Result<(), AnyEr
     Ok(())
 }
 
+#[op2(fast)]
+fn op_set_raw(
+    _state: &mut OpState,
+    _rid: u32,
+    _is_raw: bool,
+    _cbreak: bool,
+) -> Result<(), AnyError> {
+    Ok(())
+}
+
+#[op2]
+#[serde]
+pub fn op_bootstrap_unstable_args(_state: &mut OpState) -> Vec<String> {
+    vec![]
+}
+
 deno_core::extension!(
     sb_core_main_js,
     ops = [
-        op_is_terminal,
+        /*op_is_terminal,*/
         op_stdin_set_raw,
         op_console_size,
         op_read_line_prompt,
         op_set_exit_code,
-        op_runtime_metrics
+        op_runtime_metrics,
+        op_schedule_mem_check,
+        op_runtime_memory_usage,
+        op_set_raw,
+        op_bootstrap_unstable_args
     ],
     esm_entry_point = "ext:sb_core_main_js/js/bootstrap.js",
     esm = [

@@ -3,12 +3,13 @@
 // TODO(petamoriken): enable prefer-primordials for node polyfills
 // deno-lint-ignore-file prefer-primordials
 
-import { core } from "ext:core/mod.js";
+import { core, internals } from "ext:core/mod.js";
 import { createDeferredPromise } from "ext:deno_node/internal/util.mjs";
 import {
   op_fetch_response_upgrade,
   op_fetch_send,
   op_node_http_request,
+  op_http_upgrade_raw2,
 } from "ext:core/ops";
 
 import { TextEncoder } from "ext:deno_web/08_text_encoding.js";
@@ -58,7 +59,6 @@ import {
   ERR_UNESCAPED_CHARACTERS,
 } from "ext:deno_node/internal/errors.ts";
 import { getTimerDuration } from "ext:deno_node/internal/timers.mjs";
-import { serve, upgradeHttpRaw } from "ext:deno_http/00_serve.js";
 import { createHttpClient } from "ext:deno_fetch/22_http_client.js";
 import { headersEntries } from "ext:deno_fetch/20_headers.js";
 import { timerId } from "ext:deno_web/03_abort_signal.js";
@@ -282,11 +282,11 @@ const kUniqueHeaders = Symbol("kUniqueHeaders");
 
 class FakeSocket extends EventEmitter {
   constructor(
-    opts: {
-      encrypted?: boolean | undefined;
-      remotePort?: number | undefined;
-      remoteAddress?: string | undefined;
-    } = {},
+      opts: {
+        encrypted?: boolean | undefined;
+        remotePort?: number | undefined;
+        remoteAddress?: string | undefined;
+      } = {},
   ) {
     super();
     this.remoteAddress = opts.remoteAddress;
@@ -296,11 +296,11 @@ class FakeSocket extends EventEmitter {
     this.readable = true;
   }
 
-  setKeepAlive() {}
+  setKeepAlive() { }
 
-  end() {}
+  end() { }
 
-  destroy() {}
+  destroy() { }
 
   setTimeout(callback, timeout = 0, ...args) {
     setTimeout(callback, timeout, args);
@@ -320,9 +320,9 @@ class ClientRequest extends OutgoingMessage {
   path: string;
 
   constructor(
-    input: string | URL,
-    options?: RequestOptions,
-    cb?: (res: IncomingMessageForClient) => void,
+      input: string | URL,
+      options?: RequestOptions,
+      cb?: (res: IncomingMessageForClient) => void,
   ) {
     super();
 
@@ -385,7 +385,7 @@ class ClientRequest extends OutgoingMessage {
 
     const port = options!.port = options!.port || defaultPort || 80;
     const host = options!.host = validateHost(options!.hostname, "hostname") ||
-      validateHost(options!.host, "host") || "localhost";
+        validateHost(options!.host, "host") || "localhost";
 
     const setHost = options!.setHost === undefined || Boolean(options!.setHost);
 
@@ -429,8 +429,8 @@ class ClientRequest extends OutgoingMessage {
 
     if (options!.joinDuplicateHeaders !== undefined) {
       validateBoolean(
-        options!.joinDuplicateHeaders,
-        "options.joinDuplicateHeaders",
+          options!.joinDuplicateHeaders,
+          "options.joinDuplicateHeaders",
       );
     }
 
@@ -442,12 +442,12 @@ class ClientRequest extends OutgoingMessage {
     }
 
     if (
-      method === "GET" ||
-      method === "HEAD" ||
-      method === "DELETE" ||
-      method === "OPTIONS" ||
-      method === "TRACE" ||
-      method === "CONNECT"
+        method === "GET" ||
+        method === "HEAD" ||
+        method === "DELETE" ||
+        method === "OPTIONS" ||
+        method === "TRACE" ||
+        method === "CONNECT"
     ) {
       this.useChunkedEncodingByDefault = false;
     } else {
@@ -502,9 +502,9 @@ class ClientRequest extends OutgoingMessage {
         // https://tools.ietf.org/html/rfc3986#section-3.2.2
         const posColon = hostHeader.indexOf(":");
         if (
-          posColon !== -1 &&
-          hostHeader.includes(":", posColon + 1) &&
-          hostHeader.charCodeAt(0) !== 91 /* '[' */
+            posColon !== -1 &&
+            hostHeader.includes(":", posColon + 1) &&
+            hostHeader.charCodeAt(0) !== 91 /* '[' */
         ) {
           hostHeader = `[${hostHeader}]`;
         }
@@ -517,8 +517,8 @@ class ClientRequest extends OutgoingMessage {
 
       if (options!.auth && !this.getHeader("Authorization")) {
         this.setHeader(
-          "Authorization",
-          "Basic " +
+            "Authorization",
+            "Basic " +
             Buffer.from(options!.auth).toString("base64"),
         );
       }
@@ -599,7 +599,7 @@ class ClientRequest extends OutgoingMessage {
     this._client = client;
 
     if (
-      this.method === "POST" || this.method === "PATCH" || this.method === "PUT"
+        this.method === "POST" || this.method === "PATCH" || this.method === "PUT"
     ) {
       const { readable, writable } = new TransformStream({
         cancel: (e) => {
@@ -614,11 +614,11 @@ class ClientRequest extends OutgoingMessage {
     }
 
     this._req = op_node_http_request(
-      this.method,
-      url,
-      headers,
-      client.rid,
-      this._bodyWriteRid,
+        this.method,
+        url,
+        headers,
+        client.rid,
+        this._bodyWriteRid,
     );
   }
 
@@ -627,8 +627,8 @@ class ClientRequest extends OutgoingMessage {
       throw new ERR_HTTP_HEADERS_SENT("render");
     }
     this._storeHeader(
-      this.method + " " + this.path + " HTTP/1.1\r\n",
-      this[kOutHeaders],
+        this.method + " " + this.path + " HTTP/1.1\r\n",
+        this[kOutHeaders],
     );
   }
 
@@ -702,8 +702,8 @@ class ClientRequest extends OutgoingMessage {
         }
 
         incoming._addHeaderLines(
-          res.headers,
-          Object.entries(res.headers).flat().length,
+            res.headers,
+            Object.entries(res.headers).flat().length,
         );
 
         if (this._req.cancelHandleRid !== null) {
@@ -722,23 +722,23 @@ class ClientRequest extends OutgoingMessage {
           }
 
           const upgradeRid = await op_fetch_response_upgrade(
-            res.responseRid,
+              res.responseRid,
           );
           assert(typeof res.remoteAddrIp !== "undefined");
           assert(typeof res.remoteAddrIp !== "undefined");
           const conn = new TcpConn(
-            upgradeRid,
-            {
-              transport: "tcp",
-              hostname: res.remoteAddrIp,
-              port: res.remoteAddrIp,
-            },
-            // TODO(bartlomieju): figure out actual values
-            {
-              transport: "tcp",
-              hostname: "127.0.0.1",
-              port: 80,
-            },
+              upgradeRid,
+              {
+                transport: "tcp",
+                hostname: res.remoteAddrIp,
+                port: res.remoteAddrIp,
+              },
+              // TODO(bartlomieju): figure out actual values
+              {
+                transport: "tcp",
+                hostname: "127.0.0.1",
+                port: 80,
+              },
           );
           const socket = new Socket({
             handle: new TCP(constants.SERVER, conn),
@@ -765,15 +765,15 @@ class ClientRequest extends OutgoingMessage {
           // if the request body stream errored, we want to propagate that error
           // instead of the original error from opFetchSend
           throw new TypeError(
-            "Failed to fetch: request body stream errored",
-            {
-              cause: this._requestSendError,
-            },
+              "Failed to fetch: request body stream errored",
+              {
+                cause: this._requestSendError,
+              },
           );
         }
 
         if (
-          err.message.includes("connection closed before message completed")
+            err.message.includes("connection closed before message completed")
         ) {
           // Node.js seems ignoring this error
         } else if (err.message.includes("The signal has been aborted")) {
@@ -840,9 +840,8 @@ class ClientRequest extends OutgoingMessage {
       path = "/" + path;
     }
     const url = new URL(
-      `${protocol}//${auth ? `${auth}@` : ""}${host}${
-        port === 80 ? "" : `:${port}`
-      }${path}`,
+        `${protocol}//${auth ? `${auth}@` : ""}${host}${port === 80 ? "" : `:${port}`
+        }${path}`,
     );
     url.hash = hash;
     return url.href;
@@ -888,8 +887,8 @@ class ClientRequest extends OutgoingMessage {
 
     if (Array.isArray(value)) {
       if (
-        (value.length < 2 || !isCookieField(key)) &&
-        (!this[kUniqueHeaders] || !this[kUniqueHeaders].has(key.toLowerCase()))
+          (value.length < 2 || !isCookieField(key)) &&
+          (!this[kUniqueHeaders] || !this[kUniqueHeaders].has(key.toLowerCase()))
       ) {
         // Retain for(;;) loop for performance reasons
         // Refs: https://github.com/nodejs/node/pull/30958
@@ -918,7 +917,7 @@ function isCookieField(s) {
 
 function isContentDispositionField(s) {
   return s.length === 19 &&
-    s.toLowerCase() === "content-disposition";
+      s.toLowerCase() === "content-disposition";
 }
 
 const kHeaders = Symbol("kHeaders");
@@ -1355,8 +1354,8 @@ export class ServerResponse extends NodeWritable {
   }
 
   constructor(
-    resolve: (value: Response | PromiseLike<Response>) => void,
-    socket: FakeSocket,
+      resolve: (value: Response | PromiseLike<Response>) => void,
+      socket: FakeSocket,
   ) {
     let controller: ReadableByteStreamController;
     const readable = new ReadableStream({
@@ -1437,8 +1436,8 @@ export class ServerResponse extends NodeWritable {
       this.statusMessage = "OK";
     }
     if (
-      typeof singleChunk === "string" &&
-      !this.hasHeader("content-type")
+        typeof singleChunk === "string" &&
+        !this.hasHeader("content-type")
     ) {
       this.setHeader("content-type", "text/plain;charset=UTF-8");
     }
@@ -1452,11 +1451,11 @@ export class ServerResponse extends NodeWritable {
       body = null;
     }
     this.#resolve(
-      new Response(body, {
-        headers: this.#headers,
-        status: this.statusCode,
-        statusText: this.statusMessage,
-      }),
+        new Response(body, {
+          headers: this.#headers,
+          status: this.statusCode,
+          statusText: this.statusMessage,
+        }),
     );
   }
 
@@ -1547,7 +1546,7 @@ export class IncomingMessageForServer extends NodeReadable {
 
   get upgrade(): boolean {
     return Boolean(
-      this.#req.headers.get("connection")?.toLowerCase().includes("upgrade") &&
+        this.#req.headers.get("connection")?.toLowerCase().includes("upgrade") &&
         this.#req.headers.get("upgrade"),
     );
   }
@@ -1559,8 +1558,8 @@ export class IncomingMessageForServer extends NodeReadable {
 }
 
 export type ServerHandler = (
-  req: IncomingMessageForServer,
-  res: ServerResponse,
+    req: IncomingMessageForServer,
+    res: ServerResponse,
 ) => void;
 
 export function Server(opts, requestListener?: ServerHandler): ServerImpl {
@@ -1639,12 +1638,28 @@ export class ServerImpl extends EventEmitter {
       });
       const req = new IncomingMessageForServer(request, socket);
       if (req.upgrade && this.listenerCount("upgrade") > 0) {
-        const { conn, response } = upgradeHttpRaw(request);
+        const tag = internals.getKhulnasoftTag(request);
+
+        if (tag === void 0) {
+          throw new TypeError("Unable to find khulnasoft tag");
+        }
+
+        const { streamRid } = tag;
+        const [upgradeRid, fenceRid] = op_http_upgrade_raw2(streamRid);
+        const conn = new TcpConn(
+            upgradeRid,
+            info?.remoteAddr,
+            info?.localAddr
+        );
+
         const socket = new Socket({
           handle: new TCP(constants.SERVER, conn),
         });
+
+        tag.fenceRid = fenceRid;
         this.emit("upgrade", req, socket, Buffer.from([]));
-        return response;
+
+        return internals.RAW_UPGRADE_RESPONSE_SENTINEL;
       } else {
         return new Promise<Response>((resolve): void => {
           const res = new ServerResponse(resolve, socket);
@@ -1747,17 +1762,17 @@ export function createServer(opts, requestListener?: ServerHandler) {
 
 /** Makes an HTTP request. */
 export function request(
-  url: string | URL,
-  cb?: (res: IncomingMessageForClient) => void,
+    url: string | URL,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 export function request(
-  opts: RequestOptions,
-  cb?: (res: IncomingMessageForClient) => void,
+    opts: RequestOptions,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 export function request(
-  url: string | URL,
-  opts: RequestOptions,
-  cb?: (res: IncomingMessageForClient) => void,
+    url: string | URL,
+    opts: RequestOptions,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 // deno-lint-ignore no-explicit-any
 export function request(...args: any[]) {
@@ -1766,17 +1781,17 @@ export function request(...args: any[]) {
 
 /** Makes a `GET` HTTP request. */
 export function get(
-  url: string | URL,
-  cb?: (res: IncomingMessageForClient) => void,
+    url: string | URL,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 export function get(
-  opts: RequestOptions,
-  cb?: (res: IncomingMessageForClient) => void,
+    opts: RequestOptions,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 export function get(
-  url: string | URL,
-  opts: RequestOptions,
-  cb?: (res: IncomingMessageForClient) => void,
+    url: string | URL,
+    opts: RequestOptions,
+    cb?: (res: IncomingMessageForClient) => void,
 ): ClientRequest;
 // deno-lint-ignore no-explicit-any
 export function get(...args: any[]) {

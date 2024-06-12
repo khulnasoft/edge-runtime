@@ -1,8 +1,16 @@
-import { serve } from 'https://deno.land/std@0.131.0/http/server.ts';
+// @ts-ignore
+import { STATUS_CODE } from 'https://deno.land/std/http/status.ts';
 
 console.log('main function started');
 
-serve(async (req: Request) => {
+// log system memory usage every 30s
+// setInterval(() => console.log(EdgeRuntime.systemMemoryInfo()), 30 * 1000);
+
+Deno.serve(async (req: Request) => {
+	const headers = new Headers({
+		'Content-Type': 'application/json',
+	});
+
 	const url = new URL(req.url);
 	const { pathname } = url;
 
@@ -10,7 +18,10 @@ serve(async (req: Request) => {
 	if (pathname === '/_internal/health') {
 		return new Response(
 			JSON.stringify({ 'message': 'ok' }),
-			{ status: 200, headers: { 'Content-Type': 'application/json' } },
+			{
+				status: STATUS_CODE.OK,
+				headers,
+			},
 		);
 	}
 
@@ -26,18 +37,18 @@ serve(async (req: Request) => {
 	// 	if (upgrade.toLowerCase() != "websocket") {
 	// 		return new Response("request isn't trying to upgrade to websocket.");
 	// 	}
-	
+
 	// 	const { socket, response } = Deno.upgradeWebSocket(req);
-	
+
 	// 	socket.onopen = () => console.log("socket opened");
 	// 	socket.onmessage = (e) => {
 	// 		console.log("socket message:", e.data);
 	// 		socket.send(new Date().toString());
 	// 	};
-	
+
 	// 	socket.onerror = e => console.log("socket errored:", e.message);
 	// 	socket.onclose = () => console.log("socket closed");
-	
+
 	// 	return response; // 101 (Switching Protocols)
 	// }
 
@@ -48,12 +59,12 @@ serve(async (req: Request) => {
 		const error = { msg: 'missing function name in request' };
 		return new Response(
 			JSON.stringify(error),
-			{ status: 400, headers: { 'Content-Type': 'application/json' } },
+			{ status: STATUS_CODE.BadRequest, headers: { 'Content-Type': 'application/json' } },
 		);
 	}
 
 	const servicePath = `./examples/${service_name}`;
-	console.error(`serving the request with ${servicePath}`);
+	// console.error(`serving the request with ${servicePath}`);
 
 	const createWorker = async () => {
 		const memoryLimitMb = 150;
@@ -67,6 +78,7 @@ serve(async (req: Request) => {
 		//     "cors": "./examples/_shared/cors.ts"
 		//   }
 		// }
+
 		// const importMapPath = `data:${encodeURIComponent(JSON.stringify(importMap))}?${encodeURIComponent('/home/deno/functions/test')}`;
 		const importMapPath = null;
 		const envVarsObj = Deno.env.toObject();
@@ -119,6 +131,8 @@ serve(async (req: Request) => {
 			console.error(e);
 
 			if (e instanceof Deno.errors.WorkerRequestCancelled) {
+				headers.append('Connection', 'close');
+
 				// XXX(Nyannyacha): I can't think right now how to re-poll
 				// inside the worker pool without exposing the error to the
 				// surface.
@@ -130,14 +144,17 @@ serve(async (req: Request) => {
 				// The current request to the worker has been canceled due to
 				// some internal reasons. We should repoll the worker and call
 				// `fetch` again.
+
 				// return await callWorker();
-				console.log('cancelled!');
 			}
 
 			const error = { msg: e.toString() };
 			return new Response(
 				JSON.stringify(error),
-				{ status: 500, headers: { 'Content-Type': 'application/json' } },
+				{
+					status: STATUS_CODE.InternalServerError,
+					headers,
+				},
 			);
 		}
 	};

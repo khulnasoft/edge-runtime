@@ -1,7 +1,7 @@
 # Khulnasoft Edge Runtime
 
 A web server based on [Deno](https://deno.land) runtime, capable of running JavaScript, TypeScript, and WASM services.
-Edge Runtime is built and maintained by the [Khulnasoft team](https://khulnasoft.io). For more details, read the [intro blog post](https://khulnasoft.com/blog/edge-runtime-self-hosted-deno-functions).
+Edge Runtime is built and maintained by the [Khulnasoft team](https://khulnasoft.com). For more details, read the [intro blog post](https://khulnasoft.com/blog/edge-runtime-self-hosted-deno-functions).
 
 You can use it to:
 
@@ -12,7 +12,7 @@ You can use it to:
 
 ## Architecture
 
-![Sequence diagram of Edge Runtime request flow](https://github.com/khulnasoft/edge-runtime/blob/main/edge-runtime-diagram.svg?raw=true)
+![Sequence diagram of Edge Runtime request flow](assets/edge-runtime-diagram.svg?raw=true)
 
 The edge runtime can be divided into two runtimes with different purposes.
 - Main runtime:
@@ -25,44 +25,8 @@ The edge runtime can be divided into two runtimes with different purposes.
   - Limits are required to be set such as: Memory and Timeouts.
   - Has access to environment variables explictly allowed by the main runtime.
 
-## How to run locally
-To serve all functions in the examples folder on port 9000, you can do this with the [example main service](./examples/main/index.ts) provided with this repo
-```sh
-./scripts/run.sh
-```
-
-Test by calling the [hello world function](./examples/hello-world/index.ts)
-```sh
-curl --request POST 'http://localhost:9000/hello-world' \
---header 'Content-Type: application/json' \
---data-raw '{
-    "name": "John Doe"
-}'
-```
-
-To run with a different entry point, you can pass a different main service like below
-
-```sh
-./scripts/run.sh start --main-service /path/to/main-service-directory -p 9000
-```
-
-using Docker:
-
-```
-docker build -t khulnasoft/edge-runtime .
-docker run -it --rm -p 9000:9000 -v ./examples/:/examples khulnasoft/edge-runtime start --main-service /examples/main
-```
-
-## How to run tests
-
-```sh
-./scripts/test.sh [TEST_NAME]
-```
-
-## How to update to a newer Deno version
-
-* Select the Deno version to upgrade and visit its tag on GitHub (eg: https://github.com/denoland/deno/blob/v1.30.3/Cargo.toml)
-* Open the `Cargo.toml` at the root of of this repo and modify all `deno_*` modules to match to the selected tag of Deno.
+## Developers
+To learn how to build / test Edge Runtime, visit [DEVELOPERS.md](DEVELOPERS.md)
 
 ## Contributions
 

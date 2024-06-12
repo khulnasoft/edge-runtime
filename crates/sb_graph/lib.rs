@@ -8,8 +8,11 @@ use deno_core::{serde_json, FastString, JsBuffer, ModuleSpecifier};
 use deno_fs::{FileSystem, RealFs};
 use deno_npm::NpmSystemInfo;
 use eszip::{EszipV2, ModuleKind};
+use glob::glob;
+use log::error;
 use sb_fs::{build_vfs, VfsOpts};
 use sb_npm::InnerCliNpmResolverRef;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fs;
 use std::fs::{create_dir_all, File};
@@ -18,12 +21,48 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub mod emitter;
+pub mod graph_fs;
 pub mod graph_resolver;
 pub mod graph_util;
 pub mod import_map;
+pub mod jsr;
+pub mod jsx_util;
 
 pub const VFS_ESZIP_KEY: &str = "---KHULNASOFT-VFS-DATA-ESZIP---";
 pub const SOURCE_CODE_ESZIP_KEY: &str = "---KHULNASOFT-SOURCE-CODE-ESZIP---";
+pub const STATIC_FILES_ESZIP_KEY: &str = "---KHULNASOFT-STATIC-FILES-ESZIP---";
+pub const STATIC_FS_PREFIX: &str = "mnt/data";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecoratorType {
+    /// Use TC39 Decorators Proposal - https://github.com/tc39/proposal-decorators
+    Tc39,
+    /// Use TypeScript experimental decorators.
+    Typescript,
+    /// Use TypeScript experimental decorators. It also emits metadata.
+    TypescriptWithMetadata,
+}
+
+impl Default for DecoratorType {
+    fn default() -> Self {
+        Self::Typescript
+    }
+}
+
+impl DecoratorType {
+    fn is_use_decorators_proposal(self) -> bool {
+        matches!(self, Self::Tc39)
+    }
+
+    fn is_use_ts_decorators(self) -> bool {
+        matches!(self, Self::Typescript | Self::TypescriptWithMetadata)
+    }
+
+    fn is_emit_metadata(self) -> bool {
+        matches!(self, Self::TypescriptWithMetadata)
+    }
+}
 
 #[derive(Debug)]
 pub enum EszipPayloadKind {
@@ -66,7 +105,9 @@ pub async fn generate_binary_eszip(
         let source_code: Arc<str> = if let Some(code) = maybe_module_code {
             code.as_str().into()
         } else {
-            let entry_content = RealFs.read_file_sync(fs_path.clone().as_path()).unwrap();
+            let entry_content = RealFs
+                .read_file_sync(fs_path.clone().as_path(), None)
+                .unwrap();
             String::from_utf8(entry_content.clone())?.into()
         };
         let emit_source = emitter_factory.emitter().unwrap().emit_parsed_source(
@@ -110,7 +151,7 @@ pub async fn generate_binary_eszip(
             InnerCliNpmResolverRef::Byonm(_) => unreachable!(),
         };
 
-        let npm_vfs = serde_json::to_string(&npm_vfs)?.as_bytes().to_vec();
+        let npm_vfs = serde_json::to_vec(&npm_vfs).unwrap().to_vec();
         let boxed_slice = npm_vfs.into_boxed_slice();
 
         eszip.add_opaque_data(String::from(VFS_ESZIP_KEY), Arc::from(boxed_slice));
@@ -135,6 +176,49 @@ pub async fn generate_binary_eszip(
         Ok(eszip)
     } else {
         eszip
+    }
+}
+
+pub async fn include_glob_patterns_in_eszip(
+    patterns: Vec<&str>,
+    eszip: &mut EszipV2,
+    prefix: Option<String>,
+) {
+    let mut static_files: Vec<String> = vec![];
+    for pattern in patterns {
+        for entry in glob(pattern).expect("Failed to read pattern") {
+            match entry {
+                Ok(path) => {
+                    let mod_path = path.to_str().unwrap().to_string();
+                    let mod_path = if let Some(file_prefix) = prefix.clone() {
+                        PathBuf::from(file_prefix)
+                            .join(PathBuf::from(mod_path))
+                            .to_str()
+                            .unwrap()
+                            .to_string()
+                    } else {
+                        mod_path
+                    };
+
+                    if path.exists() {
+                        let content = std::fs::read(path).unwrap();
+                        let arc_slice: Arc<[u8]> = Arc::from(content.into_boxed_slice());
+                        eszip.add_opaque_data(mod_path.clone(), arc_slice);
+                    }
+
+                    static_files.push(mod_path);
+                }
+                Err(_) => {
+                    error!("Error reading pattern {} for static files", pattern)
+                }
+            };
+        }
+    }
+
+    if !static_files.is_empty() {
+        let file_specifiers_as_bytes = serde_json::to_vec(&static_files).unwrap();
+        let arc_slice: Arc<[u8]> = Arc::from(file_specifiers_as_bytes.into_boxed_slice());
+        eszip.add_opaque_data(String::from(STATIC_FILES_ESZIP_KEY), arc_slice);
     }
 }
 

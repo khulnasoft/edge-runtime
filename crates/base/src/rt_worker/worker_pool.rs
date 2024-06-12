@@ -1,18 +1,19 @@
 use crate::inspector_server::Inspector;
 use crate::rt_worker::worker_ctx::{create_worker, send_user_worker_request};
-use anyhow::{anyhow, Context, Error};
+use crate::server::ServerFlags;
+use anyhow::{anyhow, bail, Context, Error};
 use enum_as_inner::EnumAsInner;
 use event_worker::events::WorkerEventWithMetadata;
 use http::Request;
 use hyper::Body;
 use log::error;
-use sb_core::conn_sync::ConnSync;
 use sb_core::util::sync::AtomicFlag;
 use sb_core::SharedMetricSource;
 use sb_workers::context::{
     CreateUserWorkerResult, SendRequestResult, Timing, TimingStatus, UserWorkerMsgs,
     UserWorkerProfile, WorkerContextInitOpts, WorkerRuntimeOpts,
 };
+use sb_workers::errors::WorkerError;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::str::FromStr;
@@ -21,7 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot::Sender;
-use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::worker_ctx::TerminationToken;
@@ -87,15 +89,15 @@ impl WorkerPoolPolicy {
     pub fn new(
         supervisor: impl Into<Option<SupervisorPolicy>>,
         max_parallelism: impl Into<Option<usize>>,
-        request_wait_timeout_ms: impl Into<Option<u64>>,
+        server_flags: ServerFlags,
     ) -> Self {
         let default = Self::default();
 
         Self {
             supervisor_policy: supervisor.into().unwrap_or(default.supervisor_policy),
             max_parallelism: max_parallelism.into().unwrap_or(default.max_parallelism),
-            request_wait_timeout_ms: request_wait_timeout_ms
-                .into()
+            request_wait_timeout_ms: server_flags
+                .request_wait_timeout_ms
                 .unwrap_or(default.request_wait_timeout_ms),
         }
     }
@@ -210,6 +212,7 @@ pub struct WorkerPool {
     pub active_workers: HashMap<String, ActiveWorkerRegistry>,
     pub worker_pool_msgs_tx: mpsc::UnboundedSender<UserWorkerMsgs>,
     pub maybe_inspector: Option<Inspector>,
+    pub maybe_request_idle_timeout: Option<u64>,
 
     // TODO: refactor this out of worker pool
     pub worker_event_sender: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>>,
@@ -222,6 +225,7 @@ impl WorkerPool {
         worker_event_sender: Option<UnboundedSender<WorkerEventWithMetadata>>,
         worker_pool_msgs_tx: mpsc::UnboundedSender<UserWorkerMsgs>,
         inspector: Option<Inspector>,
+        request_idle_timeout: Option<u64>,
     ) -> Self {
         Self {
             policy,
@@ -230,6 +234,7 @@ impl WorkerPool {
             user_workers: HashMap::new(),
             active_workers: HashMap::new(),
             maybe_inspector: inspector,
+            maybe_request_idle_timeout: request_idle_timeout,
             worker_pool_msgs_tx,
         }
     }
@@ -248,6 +253,7 @@ impl WorkerPool {
 
         let is_oneshot_policy = self.policy.supervisor_policy.is_oneshot();
         let inspector = self.maybe_inspector.clone();
+        let request_idle_timeout = self.maybe_request_idle_timeout;
 
         let force_create = worker_options
             .conf
@@ -351,6 +357,8 @@ impl WorkerPool {
                         maybe_eszip,
                         maybe_module_code,
                         maybe_entrypoint,
+                        maybe_decorator,
+                        maybe_jsx_import_source_config,
                         ..
                     } = worker_options;
 
@@ -367,6 +375,9 @@ impl WorkerPool {
                                 maybe_eszip,
                                 maybe_module_code,
                                 maybe_entrypoint,
+                                maybe_decorator,
+                                static_patterns: vec![],
+                                maybe_jsx_import_source_config,
                             },
                             tx,
                         ))
@@ -386,7 +397,7 @@ impl WorkerPool {
             };
 
             let uuid = uuid::Uuid::new_v4();
-            let cancel = Arc::<Notify>::default();
+            let cancel = CancellationToken::new();
             let (req_start_timing_tx, req_start_timing_rx) =
                 mpsc::unbounded_channel::<Arc<Notify>>();
 
@@ -414,18 +425,21 @@ impl WorkerPool {
             match create_worker(
                 (worker_options, supervisor_policy, termination_token.clone()),
                 inspector,
+                request_idle_timeout,
             )
             .await
             {
-                Ok((_, worker_request_msg_tx)) => {
+                Ok(ctx) => {
                     let profile = UserWorkerProfile {
-                        worker_request_msg_tx,
+                        worker_request_msg_tx: ctx.msg_tx,
                         timing_tx_pair: (req_start_timing_tx, req_end_timing_tx),
                         service_path,
                         permit: permit.map(Arc::new),
                         status: status.clone(),
+                        exit: ctx.exit,
                         cancel,
                     };
+
                     if worker_pool_msgs_tx
                         .send(UserWorkerMsgs::Created(uuid, profile))
                         .is_err()
@@ -468,18 +482,26 @@ impl WorkerPool {
         key: &Uuid,
         req: Request<Body>,
         res_tx: Sender<Result<SendRequestResult, Error>>,
-        conn_watch: Option<watch::Receiver<ConnSync>>,
+        conn_token: Option<CancellationToken>,
     ) {
         let _: Result<(), Error> = match self.user_workers.get(key) {
             Some(worker) => {
                 let policy = self.policy.supervisor_policy;
                 let profile = worker.clone();
+                let exit = worker.exit.clone();
                 let cancel = worker.cancel.clone();
                 let (req_start_tx, req_end_tx) = profile.timing_tx_pair.clone();
 
                 // Create a closure to handle the request and send the response
                 let request_handler = async move {
                     if !policy.is_per_worker() {
+                        if cancel.is_cancelled() {
+                            bail!(exit
+                                .error()
+                                .await
+                                .unwrap_or(anyhow!(WorkerError::RequestCancelledBySupervisor)))
+                        }
+
                         let fence = Arc::new(Notify::const_new());
 
                         if let Err(ex) = req_start_tx.send(fence.clone()) {
@@ -499,19 +521,28 @@ impl WorkerPool {
                                 .with_context(|| "failed to notify the fence to the supervisor");
                         }
 
-                        fence.notified().await;
+                        tokio::select! {
+                            _ = fence.notified() => {}
+                            _ = cancel.cancelled() => {
+                                bail!(exit
+                                    .error()
+                                    .await
+                                    .unwrap_or(anyhow!(WorkerError::RequestCancelledBySupervisor)))
+                            }
+                        }
                     }
 
                     let result = send_user_worker_request(
                         profile.worker_request_msg_tx,
-                        cancel,
                         req,
-                        conn_watch,
+                        cancel,
+                        exit,
+                        conn_token,
                     )
                     .await;
 
                     match result {
-                        Ok(rep) => Ok((rep, req_end_tx)),
+                        Ok(req) => Ok((req, req_end_tx)),
                         Err(err) => {
                             let _ = req_end_tx.send(());
                             error!("failed to send request to user worker: {}", err.to_string());
@@ -596,16 +627,11 @@ impl WorkerPool {
             return None;
         }
 
-        let Some(registry) = self.active_workers.get_mut(service_path) else {
-            return None;
-        };
-
+        let registry = self.active_workers.get_mut(service_path)?;
         let policy = self.policy.supervisor_policy;
-        let mut advance_fn = move || registry.mark_used_and_try_advance(policy).copied();
 
-        let Some(worker_uuid) = advance_fn() else {
-            return None;
-        };
+        let mut advance_fn = move || registry.mark_used_and_try_advance(policy).copied();
+        let worker_uuid = advance_fn()?;
 
         match self
             .user_workers

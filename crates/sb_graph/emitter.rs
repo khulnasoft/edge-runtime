@@ -1,5 +1,8 @@
 use crate::graph_resolver::{CliGraphResolver, CliGraphResolverOptions};
-use deno_ast::EmitOptions;
+use crate::jsx_util::{get_jsx_emit_opts, get_rt_from_jsx};
+use crate::DecoratorType;
+use deno_ast::{EmitOptions, SourceMapOption, TranspileOptions};
+use deno_config::JsxImportSourceConfig;
 use deno_core::error::AnyError;
 use deno_core::parking_lot::Mutex;
 use deno_lockfile::Lockfile;
@@ -85,9 +88,11 @@ pub struct EmitterFactory {
     package_json_deps_installer: Deferred<Arc<PackageJsonDepsInstaller>>,
     maybe_package_json_deps: Option<PackageJsonDeps>,
     maybe_lockfile: Option<LockfileOpts>,
+    maybe_decorator: Option<DecoratorType>,
     npm_resolver: Deferred<Arc<dyn CliNpmResolver>>,
     resolver: Deferred<Arc<CliGraphResolver>>,
     file_fetcher_cache_strategy: Option<CacheSetting>,
+    jsx_import_source_config: Option<JsxImportSourceConfig>,
     file_fetcher_allow_remote: bool,
     pub maybe_import_map: Option<Arc<ImportMap>>,
     file_cache: Deferred<Arc<FileCache>>,
@@ -113,12 +118,14 @@ impl EmitterFactory {
             package_json_deps_installer: Default::default(),
             maybe_package_json_deps: None,
             maybe_lockfile: None,
+            maybe_decorator: None,
             npm_resolver: Default::default(),
             resolver: Default::default(),
             file_fetcher_cache_strategy: None,
             file_fetcher_allow_remote: true,
             maybe_import_map: None,
             file_cache: Default::default(),
+            jsx_import_source_config: None,
         }
     }
 
@@ -134,6 +141,10 @@ impl EmitterFactory {
         self.maybe_import_map = import_map
             .map(|import_map| Some(Arc::new(import_map)))
             .unwrap_or_else(|| None);
+    }
+
+    pub fn set_decorator_type(&mut self, decorator_type: Option<DecoratorType>) {
+        self.maybe_decorator = decorator_type;
     }
 
     pub fn init_package_json_deps(&mut self, package: &PackageJson) {
@@ -159,8 +170,11 @@ impl EmitterFactory {
         })
     }
 
-    pub fn emit_cache(&self) -> Result<EmitCache, AnyError> {
-        Ok(EmitCache::new(self.deno_dir.gen_cache.clone()))
+    pub fn emit_cache(&self, transpile_options: TranspileOptions) -> Result<EmitCache, AnyError> {
+        Ok(EmitCache::new(
+            self.deno_dir.gen_cache.clone(),
+            transpile_options,
+        ))
     }
 
     pub fn parsed_source_cache(&self) -> Result<Arc<ParsedSourceCache>, AnyError> {
@@ -170,18 +184,56 @@ impl EmitterFactory {
 
     pub fn emit_options(&self) -> EmitOptions {
         EmitOptions {
-            inline_source_map: true,
             inline_sources: true,
-            source_map: true,
+            source_map: SourceMapOption::Inline,
+            ..Default::default()
+        }
+    }
+
+    pub fn transpile_options(&self) -> TranspileOptions {
+        let (specifier, module) = if let Some(jsx_config) = self.jsx_import_source_config.clone() {
+            (jsx_config.default_specifier, jsx_config.module)
+        } else {
+            (None, "react".to_string())
+        };
+
+        let jsx_module = get_rt_from_jsx(Some(module));
+
+        let (transform_jsx, jsx_automatic, jsx_development, precompile_jsx) =
+            get_jsx_emit_opts(jsx_module.as_str());
+
+        TranspileOptions {
+            use_decorators_proposal: self
+                .maybe_decorator
+                .map(DecoratorType::is_use_decorators_proposal)
+                .unwrap_or_default(),
+
+            use_ts_decorators: self
+                .maybe_decorator
+                .map(DecoratorType::is_use_ts_decorators)
+                .unwrap_or_default(),
+
+            emit_metadata: self
+                .maybe_decorator
+                .map(DecoratorType::is_emit_metadata)
+                .unwrap_or_default(),
+
+            jsx_import_source: specifier,
+            transform_jsx,
+            jsx_automatic,
+            jsx_development,
+            precompile_jsx,
             ..Default::default()
         }
     }
 
     pub fn emitter(&self) -> Result<Arc<Emitter>, AnyError> {
+        let transpile_options = self.transpile_options();
         let emitter = Arc::new(Emitter::new(
-            self.emit_cache()?,
+            self.emit_cache(transpile_options.clone())?,
             self.parsed_source_cache()?,
             self.emit_options(),
+            transpile_options,
         ));
 
         Ok(emitter)
@@ -304,8 +356,14 @@ impl EmitterFactory {
     pub fn cli_graph_resolver_options(&self) -> CliGraphResolverOptions {
         CliGraphResolverOptions {
             maybe_import_map: self.maybe_import_map.clone(),
+            maybe_jsx_import_source_config: self.jsx_import_source_config.clone(),
+            no_npm: !self.file_fetcher_allow_remote,
             ..Default::default()
         }
+    }
+
+    pub async fn set_jsx_import_source(&mut self, config: JsxImportSourceConfig) {
+        self.jsx_import_source_config = Some(config);
     }
 
     pub async fn cli_graph_resolver(&self) -> &Arc<CliGraphResolver> {
@@ -316,7 +374,11 @@ impl EmitterFactory {
                     self.package_json_deps_provider().clone(),
                     self.package_json_deps_installer().await.clone(),
                     self.cli_graph_resolver_options(),
-                    Some(self.npm_resolver().await.clone()),
+                    if self.file_fetcher_allow_remote {
+                        Some(self.npm_resolver().await.clone())
+                    } else {
+                        None
+                    },
                 )))
             })
             .await
@@ -345,11 +407,12 @@ impl EmitterFactory {
     pub fn file_fetcher_loader(&self) -> Box<dyn Loader> {
         let global_cache_struct =
             GlobalHttpCache::new(self.deno_dir.deps_folder_path(), RealDenoCacheEnv);
+
         let parsed_source = self.parsed_source_cache().unwrap();
 
         Box::new(FetchCacher::new(
             self.module_info_cache().unwrap().clone(),
-            self.emit_cache().unwrap(),
+            self.emit_cache(self.transpile_options()).unwrap(),
             Arc::new(self.file_fetcher()),
             HashMap::new(),
             Arc::new(global_cache_struct),
