@@ -26,13 +26,15 @@ mod linux {
         Remove(usize),
     }
 
-    pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    pub static mut SIG_MSG_CHAN: Lazy<(
+    type SignalMessageChannel = (
         mpsc::UnboundedSender<SignalMsg>,
-        Option<mpsc::UnboundedReceiver<SignalMsg>>,
-    )> = Lazy::new(|| {
+        std::sync::Mutex<Option<mpsc::UnboundedReceiver<SignalMsg>>>,
+    );
+
+    pub static TIMER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    pub static SIG_MSG_CHAN: Lazy<SignalMessageChannel> = Lazy::new(|| {
         let (sig_msg_tx, sig_msg_rx) = mpsc::unbounded_channel::<SignalMsg>();
-        (sig_msg_tx, Some(sig_msg_rx))
+        (sig_msg_tx, std::sync::Mutex::new(Some(sig_msg_rx)))
     });
 }
 
@@ -64,7 +66,9 @@ pub struct CPUTimer {
 impl Drop for CPUTimer {
     fn drop(&mut self) {
         if Arc::strong_count(&self.timer) == 2 {
-            unsafe { linux::SIG_MSG_CHAN.0.clone() }
+            linux::SIG_MSG_CHAN
+                .0
+                .clone()
                 .send(linux::SignalMsg::Remove(self.id))
                 .unwrap();
         }
@@ -122,7 +126,9 @@ impl CPUTimer {
         Ok({
             this.reset()?;
 
-            unsafe { linux::SIG_MSG_CHAN.0.clone() }
+            linux::SIG_MSG_CHAN
+                .0
+                .clone()
                 .send(SignalMsg::Add((id, this.clone())))
                 .unwrap();
 
@@ -193,7 +199,6 @@ fn register_sigalrm() {
     use futures::StreamExt;
     use linux::SignalMsg;
     use log::{debug, error};
-    use once_cell::sync::Lazy;
     use signal_hook::{consts::signal, iterator::exfiltrator::raw};
     use signal_hook_tokio::SignalsInfo;
 
@@ -201,23 +206,15 @@ fn register_sigalrm() {
 
     let mut registry = HashMap::<usize, CPUTimer>::new();
 
-    let sig_msg_tx = unsafe { linux::SIG_MSG_CHAN.0.clone() };
-    let mut sig_msg_rx = Lazy::force_mut(unsafe { &mut linux::SIG_MSG_CHAN })
-        .1
-        .take()
-        .unwrap();
+    let sig_msg_tx = linux::SIG_MSG_CHAN.0.clone();
+    let mut sig_msg_rx = linux::SIG_MSG_CHAN.1.lock().unwrap().take().unwrap();
 
     std::thread::Builder::new()
         .name("sb-cpu-timer".into())
         .spawn(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let sig_receiver_handle = rt.spawn(async move {
-                let mut signals =
-                    SignalsInfo::with_exfiltrator([signal::SIGALRM], raw::WithRawSiginfo).unwrap();
+                let mut signals = SignalsInfo::with_exfiltrator([signal::SIGALRM], raw::WithRawSiginfo).unwrap();
 
                 while let Some(siginfo) = signals.next().await {
                     let _ = sig_timer_id_tx.send(unsafe { siginfo.si_value().sival_ptr as usize });

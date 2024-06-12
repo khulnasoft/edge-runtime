@@ -16,11 +16,6 @@ jobs:
       packages: write
       id-token: write
     steps:
-      - name: configure aws credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          role-to-assume: ${{ secrets.PROD_AWS_ROLE }}
-          aws-region: 'us-east-1'
       - uses: docker/login-action@v2
         with:
           registry: public.ecr.aws

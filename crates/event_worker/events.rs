@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
+use strum::IntoStaticStr;
 use uuid::Uuid;
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct PseudoEvent {}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BootEvent {
@@ -18,13 +16,60 @@ pub struct WorkerMemoryUsed {
     pub total: usize,
     pub heap: usize,
     pub external: usize,
+    pub mem_check_captured: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct MemoryLimitDetailMemCheck {
+    pub captured: usize,
+}
+
+impl std::fmt::Display for MemoryLimitDetailMemCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryLimitDetailMemCheck")
+            .field("captured", &self.captured)
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+pub struct MemoryLimitDetailV8 {
+    pub current: usize,
+    pub initial: usize,
+}
+
+impl std::fmt::Display for MemoryLimitDetailV8 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryLimitDetailV8")
+            .field("current", &self.current)
+            .field("initial", &self.initial)
+            .finish()
+    }
+}
+
+#[derive(Serialize, Deserialize, IntoStaticStr, Debug, Clone, Copy)]
+#[serde(tag = "limited_by")]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum MemoryLimitDetail {
+    MemCheck(MemoryLimitDetailMemCheck),
+    V8(MemoryLimitDetailV8),
+}
+
+impl std::fmt::Display for MemoryLimitDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MemCheck(arg) => std::fmt::Display::fmt(arg, f),
+            Self::V8(arg) => std::fmt::Display::fmt(arg, f),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ShutdownReason {
     WallClockTime,
     CPUTime,
-    Memory,
+    Memory(MemoryLimitDetail),
     EarlyDrop,
     TerminationRequested,
 }
@@ -36,9 +81,14 @@ pub struct ShutdownEvent {
     pub memory_used: WorkerMemoryUsed,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UncaughtExceptionEvent {
     pub exception: String,
+    pub cpu_time_used: usize,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct EventLoopCompletedEvent {
     pub cpu_time_used: usize,
 }
 
@@ -62,8 +112,23 @@ pub enum WorkerEvents {
     BootFailure(BootFailureEvent),
     UncaughtException(UncaughtExceptionEvent),
     Shutdown(ShutdownEvent),
-    EventLoopCompleted(PseudoEvent),
+    EventLoopCompleted(EventLoopCompletedEvent),
     Log(LogEvent),
+}
+
+impl WorkerEvents {
+    pub fn with_cpu_time_used(mut self, cpu_time_used_ms: usize) -> Self {
+        match &mut self {
+            Self::UncaughtException(UncaughtExceptionEvent { cpu_time_used, .. })
+            | Self::Shutdown(ShutdownEvent { cpu_time_used, .. }) => {
+                *cpu_time_used = cpu_time_used_ms;
+            }
+
+            _ => {}
+        }
+
+        self
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]

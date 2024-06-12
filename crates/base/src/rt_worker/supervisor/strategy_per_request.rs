@@ -42,6 +42,10 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
     let (cpu_timer, mut cpu_alarms_rx) = cpu_timer.unzip();
     let (_, hard_limit_ms) = cpu_timer_param.limits();
 
+    let _guard = scopeguard::guard(is_retired, |v| {
+        v.raise();
+    });
+
     #[cfg(debug_assertions)]
     let mut current_thread_id = Option::<ThreadId>::None;
 
@@ -54,10 +58,14 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
     let mut req_ack_count = 0usize;
     let mut req_start_ack = false;
 
-    // reduce 100ms from wall clock duration, so the interrupt can be handled before
-    // isolate is dropped
-    let wall_clock_duration = Duration::from_millis(runtime_opts.worker_timeout_ms)
-        .saturating_sub(Duration::from_millis(100));
+    let wall_clock_limit_ms = runtime_opts.worker_timeout_ms;
+    let is_wall_clock_limit_disabled = wall_clock_limit_ms == 0;
+
+    let wall_clock_duration = Duration::from_millis(if wall_clock_limit_ms < 1 {
+        1
+    } else {
+        wall_clock_limit_ms
+    });
 
     let wall_clock_duration_alert = tokio::time::sleep(wall_clock_duration);
 
@@ -108,7 +116,7 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
 
                         if !cpu_timer_param.is_disabled() {
                             if cpu_usage_ms >= hard_limit_ms as i64 {
-                                error!("CPU time limit reached. isolate: {:?}", key);
+                                error!("CPU time limit reached: isolate: {:?}", key);
                                 complete_reason = Some(ShutdownReason::CPUTime);
                             }
 
@@ -122,7 +130,7 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
 
             Some(_) = wait_cpu_alarm(cpu_alarms_rx.as_mut()) => {
                 if is_worker_entered && req_start_ack {
-                    error!("CPU time limit reached. isolate: {:?}", key);
+                    error!("CPU time limit reached: isolate: {:?}", key);
                     complete_reason = Some(ShutdownReason::CPUTime);
                 }
             }
@@ -155,7 +163,7 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
                 complete_reason = Some(ShutdownReason::EarlyDrop);
             }
 
-            _ = &mut wall_clock_duration_alert => {
+            _ = &mut wall_clock_duration_alert, if !is_wall_clock_limit_disabled => {
                 if !oneshot && req_ack_count != demand.load(Ordering::Acquire) {
                     wall_clock_duration_alert
                         .as_mut()
@@ -163,14 +171,14 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
 
                     continue;
                 } else {
-                    error!("wall clock duraiton reached. isolate: {:?}", key);
+                    error!("wall clock duraiton reached: isolate: {:?}", key);
                     complete_reason = Some(ShutdownReason::WallClockTime);
                 }
             }
 
-            Some(_) = memory_limit_rx.recv() => {
-                error!("memory limit reached for the worker. isolate: {:?}", key);
-                complete_reason = Some(ShutdownReason::Memory);
+            Some(detail) = memory_limit_rx.recv() => {
+                error!("memory limit reached for the worker: isolate: {:?}", key);
+                complete_reason = Some(ShutdownReason::Memory(detail));
             }
         }
 
@@ -191,8 +199,6 @@ pub async fn supervise(args: Arguments, oneshot: bool) -> (ShutdownReason, i64) 
             }
 
             Some(reason) => {
-                is_retired.raise();
-
                 let data_ptr_mut = Box::into_raw(Box::new(IsolateInterruptData {
                     should_terminate: true,
                     isolate_memory_usage_tx: Some(isolate_memory_usage_tx),

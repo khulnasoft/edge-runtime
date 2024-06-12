@@ -1,15 +1,17 @@
 use crate::deno_runtime::DenoRuntime;
 use crate::inspector_server::Inspector;
+use crate::timeout::{self, CancelOnWriteTimeout, ReadTimeoutStream};
 use crate::utils::send_event_if_event_worker_available;
-use crate::utils::units::bytes_to_display;
 
 use crate::rt_worker::worker::{Worker, WorkerHandler};
 use crate::rt_worker::worker_pool::WorkerPool;
 use anyhow::{anyhow, bail, Error};
 use cpu_timer::CPUTimer;
+use deno_config::JsxImportSourceConfig;
 use deno_core::{InspectorSessionProxy, LocalInspectorSession};
 use event_worker::events::{
-    BootEvent, ShutdownEvent, WorkerEventWithMetadata, WorkerEvents, WorkerMemoryUsed,
+    BootEvent, MemoryLimitDetail, MemoryLimitDetailMemCheck, MemoryLimitDetailV8, ShutdownEvent,
+    WorkerEventWithMetadata, WorkerEvents, WorkerMemoryUsed,
 };
 use futures_util::pin_mut;
 use http::StatusCode;
@@ -19,28 +21,31 @@ use hyper::client::conn::http1;
 use hyper::upgrade::OnUpgrade;
 use hyper::{Body, Request, Response};
 use log::{debug, error};
-use sb_core::conn_sync::ConnSync;
 use sb_core::{MetricSource, SharedMetricSource};
-use sb_graph::EszipPayloadKind;
+use sb_graph::{DecoratorType, EszipPayloadKind};
 use sb_workers::context::{
     EventWorkerRuntimeOpts, MainWorkerRuntimeOpts, Timing, UserWorkerMsgs, WorkerContextInitOpts,
-    WorkerRequestMsg, WorkerRuntimeOpts,
+    WorkerExit, WorkerKind, WorkerRequestMsg, WorkerRuntimeOpts,
 };
 use sb_workers::errors::WorkerError;
 use std::future::pending;
+use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
-use tokio::net::UnixStream;
+use tokio::io::{self, copy_bidirectional};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::sleep;
+use tokio_rustls::server::TlsStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::rt;
 use super::supervisor::{self, CPUTimerParam, CPUUsageMetrics};
-use super::worker::UnixStreamEntry;
+use super::worker::DuplexStreamEntry;
 use super::worker_pool::{SupervisorPolicy, WorkerPoolPolicy};
 
 #[derive(Clone)]
@@ -81,34 +86,37 @@ impl TerminationToken {
     }
 
     pub async fn cancel_and_wait(&self) {
+        if self.outbound.is_cancelled() {
+            return;
+        }
+
         self.cancel();
         self.outbound.cancelled().await;
     }
 }
 
 async fn handle_request(
-    unix_stream_tx: mpsc::UnboundedSender<UnixStreamEntry>,
+    worker_kind: WorkerKind,
+    duplex_stream_tx: mpsc::UnboundedSender<DuplexStreamEntry>,
     msg: WorkerRequestMsg,
+    maybe_request_idle_timeout: Option<u64>,
 ) -> Result<(), Error> {
-    // create a unix socket pair
-    let (sender_stream, recv_stream) = UnixStream::pair()?;
+    let (ours, theirs) = io::duplex(1024);
     let WorkerRequestMsg {
         mut req,
         res_tx,
-        conn_watch,
+        conn_token,
     } = msg;
 
-    let _ = unix_stream_tx.send((recv_stream, conn_watch.clone()));
+    let _ = duplex_stream_tx.send((theirs, conn_token.clone()));
     let req_upgrade_type = get_upgrade_type(req.headers());
     let req_upgrade = req_upgrade_type
         .clone()
         .and_then(|it| Some(it).zip(req.extensions_mut().remove::<OnUpgrade>()));
 
-    // send the HTTP request to the worker over Unix stream
-    let (mut request_sender, connection) = http1::Builder::new()
-        .writev(true)
-        .handshake(sender_stream)
-        .await?;
+    // send the HTTP request to the worker over duplex stream
+    let (mut request_sender, connection) =
+        http1::Builder::new().writev(true).handshake(ours).await?;
 
     let (upgrade_tx, upgrade_rx) = oneshot::channel();
 
@@ -117,7 +125,11 @@ async fn handle_request(
         async move {
             match connection.without_shutdown().await {
                 Err(e) => {
-                    error!("Error in worker connection: {}", e.message());
+                    error!(
+                        "error in {} worker connection: {}",
+                        worker_kind,
+                        e.message()
+                    );
                 }
 
                 Ok(parts) => {
@@ -127,6 +139,7 @@ async fn handle_request(
                                 tokio::spawn(relay_upgraded_request_and_response(
                                     req_upgrade,
                                     parts,
+                                    maybe_request_idle_timeout,
                                 ));
 
                                 return;
@@ -134,10 +147,8 @@ async fn handle_request(
                         };
                     }
 
-                    if let Some(mut watcher) = conn_watch {
-                        if watcher.wait_for(|it| *it == ConnSync::Recv).await.is_err() {
-                            error!("cannot track outbound connection correctly");
-                        }
+                    if let Some(token) = conn_token {
+                        token.cancelled_owned().await;
                     }
                 }
             }
@@ -146,7 +157,22 @@ async fn handle_request(
 
     tokio::task::yield_now().await;
 
-    let res = request_sender.send_request(req).await;
+    let maybe_cancel_fut = async move {
+        if let Some(timeout_ms) = maybe_request_idle_timeout {
+            sleep(Duration::from_millis(timeout_ms)).await;
+        } else {
+            pending::<()>().await;
+            unreachable!()
+        }
+    };
+
+    let res = tokio::select! {
+        resp = request_sender.send_request(req) => resp,
+        _ = maybe_cancel_fut => {
+            Ok(emit_status_code(http::StatusCode::GATEWAY_TIMEOUT, None, false))
+        }
+    };
+
     let Ok(res) = res else {
         drop(res_tx.send(res));
         return Ok(());
@@ -159,9 +185,26 @@ async fn handle_request(
         match res_upgrade_type {
             Some(accepted) if accepted == requested => {}
             _ => {
-                drop(res_tx.send(Ok(emit_status_code(StatusCode::BAD_GATEWAY))));
+                drop(res_tx.send(Ok(emit_status_code(StatusCode::BAD_GATEWAY, None, true))));
                 return Ok(());
             }
+        }
+    }
+
+    if let Some(timeout_ms) = maybe_request_idle_timeout {
+        let headers = res.headers();
+        let is_streamed_response = !headers.contains_key(http::header::CONTENT_LENGTH);
+
+        if is_streamed_response {
+            let duration = Duration::from_millis(timeout_ms);
+            let (parts, body) = res.into_parts();
+
+            drop(res_tx.send(Ok(Response::from_parts(
+                parts,
+                Body::wrap_stream(CancelOnWriteTimeout::new(body, duration)),
+            ))));
+
+            return Ok(());
         }
     }
 
@@ -171,14 +214,37 @@ async fn handle_request(
 
 async fn relay_upgraded_request_and_response(
     downstream: OnUpgrade,
-    parts: http1::Parts<UnixStream>,
+    parts: http1::Parts<io::DuplexStream>,
+    maybe_idle_timeout: Option<u64>,
 ) {
-    let mut upstream = Upgraded2::new(parts.io, parts.read_buf);
+    let upstream = Upgraded2::new(parts.io, parts.read_buf);
+    let mut upstream = if let Some(timeout_ms) = maybe_idle_timeout {
+        ReadTimeoutStream::with_timeout(upstream, Duration::from_millis(timeout_ms))
+    } else {
+        ReadTimeoutStream::with_bypass(upstream)
+    };
+
     let mut downstream = downstream.await.expect("failed to upgrade request");
 
-    copy_bidirectional(&mut upstream, &mut downstream)
-        .await
-        .expect("coping between upgraded connections failed");
+    match copy_bidirectional(&mut upstream, &mut downstream).await {
+        Ok(_) => {}
+        Err(err) if matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::BrokenPipe) => {}
+        Err(err) if matches!(err.kind(), ErrorKind::UnexpectedEof) => {
+            let Ok(_) = downstream.downcast::<timeout::Stream<TlsStream<TcpStream>>>() else {
+                // TODO(Nyannyacha): It would be better if we send
+                // `close_notify` before shutdown an upstream if downstream is a
+                // TLS stream.
+
+                // INVARIANT: `UnexpectedEof` due to shutdown `DuplexStream` is
+                // only expected to occur in the context of `TlsStream`.
+                panic!("unhandleable unexpected eof");
+            };
+        }
+
+        value => {
+            unreachable!("coping between upgraded connections failed: {:?}", value);
+        }
+    }
 
     // XXX(Nyannyacha): Here you might want to emit the event metadata.
 }
@@ -191,11 +257,11 @@ pub fn create_supervisor(
     termination_event_tx: oneshot::Sender<WorkerEvents>,
     pool_msg_tx: Option<UnboundedSender<UserWorkerMsgs>>,
     cpu_usage_metrics_rx: Option<UnboundedReceiver<CPUUsageMetrics>>,
-    cancel: Option<Arc<Notify>>,
+    cancel: Option<CancellationToken>,
     timing: Option<Timing>,
     termination_token: Option<TerminationToken>,
 ) -> Result<(Option<CPUTimer>, CancellationToken), Error> {
-    let (memory_limit_tx, memory_limit_rx) = mpsc::unbounded_channel::<()>();
+    let (memory_limit_tx, memory_limit_rx) = mpsc::unbounded_channel::<MemoryLimitDetail>();
     let (waker, thread_safe_handle) = {
         let js_runtime = &mut worker_runtime.js_runtime;
         (
@@ -206,6 +272,7 @@ pub fn create_supervisor(
 
     // we assert supervisor is only run for user workers
     let conf = worker_runtime.conf.as_user_worker().unwrap().clone();
+    let mem_check_captured_bytes = worker_runtime.mem_check_captured_bytes();
     let is_termination_requested = worker_runtime.is_termination_requested.clone();
 
     let giveup_process_requests_token = cancel.clone();
@@ -227,19 +294,44 @@ pub fn create_supervisor(
         )
     });
 
-    worker_runtime.js_runtime.add_near_heap_limit_callback(move |cur, _| {
+    let send_memory_limit_fn = move |detail: MemoryLimitDetail| {
         debug!(
-            "Low memory alert triggered: {}",
-            bytes_to_display(cur as u64),
+            "memory limit triggered: isolate: {:?}, detail: {}",
+            key, detail
         );
 
-        if memory_limit_tx.send(()).is_err() {
-            error!("failed to send memory limit reached notification - isolate may already be terminating");
-        };
+        if memory_limit_tx.send(detail).is_err() {
+            error!(
+                "failed to send memory limit reached notification - isolate may already be terminating: kind: {}",
+                <&'static str>::from(&detail)
+            );
+        }
+    };
 
-        // give an allowance on current limit (until the isolate is terminated)
-        // we do this so that oom won't end up killing the edge-runtime process
-        cur * (conf.low_memory_multiplier as usize)
+    worker_runtime.add_memory_limit_callback({
+        let send_fn = send_memory_limit_fn.clone();
+        move |captured| {
+            send_fn(MemoryLimitDetail::MemCheck(MemoryLimitDetailMemCheck {
+                captured,
+            }));
+
+            true
+        }
+    });
+
+    worker_runtime.js_runtime.add_near_heap_limit_callback({
+        let send_fn = send_memory_limit_fn;
+        move |current, initial| {
+            send_fn(MemoryLimitDetail::V8(MemoryLimitDetailV8 {
+                current,
+                initial,
+            }));
+
+            // give an allowance on current limit (until the isolate is
+            // terminated) we do this so that oom won't end up killing the
+            // edge-runtime process
+            current * (conf.low_memory_multiplier as usize)
+        }
     });
 
     // Note: CPU timer must be started in the same thread as the worker runtime
@@ -289,7 +381,7 @@ pub fn create_supervisor(
             // disposed down and will not accept awaiting subsequent requests, so
             // they must be re-polled again.
             if let Some(cancel) = giveup_process_requests_token.as_ref() {
-                cancel.notify_waiters();
+                cancel.cancel();
             }
 
             if let Some((session_tx, is_terminated, is_found)) = maybe_inspector_params {
@@ -392,7 +484,9 @@ pub fn create_supervisor(
                     total: v.used_heap_size + v.external_memory,
                     heap: v.used_heap_size,
                     external: v.external_memory,
+                    mem_check_captured: mem_check_captured_bytes.load(Ordering::Acquire),
                 },
+
                 Err(_) => {
                     if !supervise_cancel_token_inner.is_cancelled() {
                         error!("isolate memory usage sender dropped");
@@ -402,6 +496,7 @@ pub fn create_supervisor(
                         total: 0,
                         heap: 0,
                         external: 0,
+                        mem_check_captured: 0,
                     }
                 }
             };
@@ -474,24 +569,34 @@ impl CreateWorkerArgs {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerCtx {
+    pub metric: MetricSource,
+    pub msg_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
+    pub exit: WorkerExit,
+}
+
 pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
     init_opts: Opt,
     inspector: Option<Inspector>,
-) -> Result<(MetricSource, mpsc::UnboundedSender<WorkerRequestMsg>), Error> {
-    let (unix_stream_tx, unix_stream_rx) = mpsc::unbounded_channel::<UnixStreamEntry>();
+    maybe_request_idle_timeout: Option<u64>,
+) -> Result<WorkerCtx, Error> {
+    let (duplex_stream_tx, duplex_stream_rx) = mpsc::unbounded_channel::<DuplexStreamEntry>();
     let (worker_boot_result_tx, worker_boot_result_rx) =
         oneshot::channel::<Result<MetricSource, Error>>();
 
-    let CreateWorkerArgs(init_opts, maybe_supervisor_policy, maybe_termination_token) =
+    let CreateWorkerArgs(worker_init_opts, maybe_supervisor_policy, maybe_termination_token) =
         init_opts.into();
 
-    let mut worker_init = Worker::new(&init_opts)?;
+    let worker_kind = worker_init_opts.conf.to_worker_kind();
+    let exit = WorkerExit::default();
+    let mut worker = Worker::new(&worker_init_opts)?;
 
-    if init_opts.conf.is_user_worker() {
-        worker_init.set_supervisor_policy(maybe_supervisor_policy);
+    if worker_kind.is_user_worker() {
+        worker.set_supervisor_policy(maybe_supervisor_policy);
     }
 
-    let worker: Box<dyn WorkerHandler> = Box::new(worker_init);
+    let worker: Box<dyn WorkerHandler> = Box::new(worker);
 
     // Downcast to call the method in "Worker" since the implementation might be of worker
     // But at the end we are using the trait itself.
@@ -500,9 +605,10 @@ pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
 
     if let Some(worker_struct_ref) = downcast_reference {
         worker_struct_ref.start(
-            init_opts,
-            (unix_stream_tx.clone(), unix_stream_rx),
+            worker_init_opts,
+            (duplex_stream_tx.clone(), duplex_stream_rx),
             worker_boot_result_tx,
+            exit.clone(),
             maybe_termination_token.clone(),
             inspector,
         );
@@ -511,13 +617,20 @@ pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
         let (worker_req_tx, mut worker_req_rx) = mpsc::unbounded_channel::<WorkerRequestMsg>();
 
         let worker_req_handle: tokio::task::JoinHandle<Result<(), Error>> = tokio::task::spawn({
-            let stream_tx = unix_stream_tx;
+            let stream_tx = duplex_stream_tx;
             async move {
                 while let Some(msg) = worker_req_rx.recv().await {
                     tokio::task::spawn({
                         let stream_tx_inner = stream_tx.clone();
                         async move {
-                            if let Err(err) = handle_request(stream_tx_inner, msg).await {
+                            if let Err(err) = handle_request(
+                                worker_kind,
+                                stream_tx_inner,
+                                msg,
+                                maybe_request_idle_timeout,
+                            )
+                            .await
+                            {
                                 error!("worker failed to handle request: {:?}", err);
                             }
                         }
@@ -541,6 +654,7 @@ pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
 
                 bail!(err)
             }
+
             Ok(metric) => {
                 let elapsed = worker_struct_ref
                     .worker_boot_start_time
@@ -555,7 +669,11 @@ pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
                     worker_struct_ref.event_metadata.clone(),
                 );
 
-                Ok((metric, worker_req_tx))
+                Ok(WorkerCtx {
+                    metric,
+                    msg_tx: worker_req_tx,
+                    exit,
+                })
             }
         }
     } else {
@@ -565,15 +683,16 @@ pub async fn create_worker<Opt: Into<CreateWorkerArgs>>(
 
 pub async fn send_user_worker_request(
     worker_request_msg_tx: mpsc::UnboundedSender<WorkerRequestMsg>,
-    cancel: Arc<Notify>,
     req: Request<Body>,
-    conn_watch: Option<watch::Receiver<ConnSync>>,
+    cancel: CancellationToken,
+    exit: WorkerExit,
+    conn_token: Option<CancellationToken>,
 ) -> Result<Response<Body>, Error> {
     let (res_tx, res_rx) = oneshot::channel::<Result<Response<Body>, hyper::Error>>();
     let msg = WorkerRequestMsg {
         req,
         res_tx,
-        conn_watch,
+        conn_token,
     };
 
     // send the message to worker
@@ -581,22 +700,44 @@ pub async fn send_user_worker_request(
 
     // wait for the response back from the worker
     let res = tokio::select! {
-        () = cancel.notified() => bail!(WorkerError::RequestCancelledBySupervisor),
-        res = res_rx => res,
-    }??;
+        () = cancel.cancelled() => {
+            bail!(exit
+                .error()
+                .await
+                .unwrap_or(anyhow!(WorkerError::RequestCancelledBySupervisor)))
+        }
 
-    // send the response back to the caller
-    Ok(res)
+        res = res_rx => res,
+    }?;
+
+    match res {
+        Ok(v) => {
+            // send the response back to the caller
+            Ok(v)
+        }
+
+        Err(err) => {
+            if let Some(actual_error) = exit.error().await {
+                return Err(actual_error);
+            }
+
+            Err(err.into())
+        }
+    }
 }
 
+// Todo: Fix
+#[allow(clippy::too_many_arguments)]
 pub async fn create_main_worker(
     main_worker_path: PathBuf,
     import_map_path: Option<String>,
     no_module_cache: bool,
     runtime_opts: MainWorkerRuntimeOpts,
     maybe_entrypoint: Option<String>,
+    maybe_decorator: Option<DecoratorType>,
     termination_token: Option<TerminationToken>,
     inspector: Option<Inspector>,
+    jsx: Option<JsxImportSourceConfig>,
 ) -> Result<mpsc::UnboundedSender<WorkerRequestMsg>, Error> {
     let mut service_path = main_worker_path.clone();
     let mut maybe_eszip = None;
@@ -607,7 +748,7 @@ pub async fn create_main_worker(
         }
     }
 
-    let (_, sender) = create_worker(
+    let ctx = create_worker(
         (
             WorkerContextInitOpts {
                 service_path,
@@ -617,18 +758,22 @@ pub async fn create_main_worker(
                 timing: None,
                 maybe_eszip,
                 maybe_entrypoint,
+                maybe_decorator,
                 maybe_module_code: None,
                 conf: WorkerRuntimeOpts::MainWorker(runtime_opts),
                 env_vars: std::env::vars().collect(),
+                static_patterns: vec![],
+                maybe_jsx_import_source_config: jsx,
             },
             termination_token,
         ),
         inspector,
+        None,
     )
     .await
     .map_err(|err| anyhow!("main worker boot error: {}", err))?;
 
-    Ok(sender)
+    Ok(ctx.msg_tx)
 }
 
 pub async fn create_events_worker(
@@ -636,8 +781,9 @@ pub async fn create_events_worker(
     import_map_path: Option<String>,
     no_module_cache: bool,
     maybe_entrypoint: Option<String>,
+    maybe_decorator: Option<DecoratorType>,
     termination_token: Option<TerminationToken>,
-) -> Result<(MetricSource, mpsc::UnboundedSender<WorkerEventWithMetadata>), Error> {
+) -> Result<(WorkerCtx, mpsc::UnboundedSender<WorkerEventWithMetadata>), Error> {
     let (events_tx, events_rx) = mpsc::unbounded_channel::<WorkerEventWithMetadata>();
 
     let mut service_path = events_worker_path.clone();
@@ -651,7 +797,7 @@ pub async fn create_events_worker(
         }
     }
 
-    let (metric, _) = create_worker(
+    let ctx = create_worker(
         (
             WorkerContextInitOpts {
                 service_path,
@@ -662,24 +808,31 @@ pub async fn create_events_worker(
                 timing: None,
                 maybe_eszip,
                 maybe_entrypoint,
+                maybe_decorator,
                 maybe_module_code: None,
                 conf: WorkerRuntimeOpts::EventsWorker(EventWorkerRuntimeOpts {}),
+                static_patterns: vec![],
+                maybe_jsx_import_source_config: None,
             },
             termination_token,
         ),
+        None,
         None,
     )
     .await
     .map_err(|err| anyhow!("events worker boot error: {}", err))?;
 
-    Ok((metric, events_tx))
+    Ok((ctx, events_tx))
 }
 
 pub async fn create_user_worker_pool(
     policy: WorkerPoolPolicy,
     worker_event_sender: Option<mpsc::UnboundedSender<WorkerEventWithMetadata>>,
     termination_token: Option<TerminationToken>,
+    static_patterns: Vec<String>,
     inspector: Option<Inspector>,
+    jsx: Option<JsxImportSourceConfig>,
+    request_idle_timeout: Option<u64>,
 ) -> Result<(SharedMetricSource, mpsc::UnboundedSender<UserWorkerMsgs>), Error> {
     let metric_src = SharedMetricSource::default();
     let (user_worker_msgs_tx, mut user_worker_msgs_rx) =
@@ -698,6 +851,7 @@ pub async fn create_user_worker_pool(
                 worker_event_sender,
                 user_worker_msgs_tx_clone,
                 inspector,
+                request_idle_timeout,
             );
 
             // Note: Keep this loop non-blocking. Spawn a task to run blocking calls.
@@ -726,24 +880,40 @@ pub async fn create_user_worker_pool(
                         match msg {
                             None => break,
                             Some(UserWorkerMsgs::Create(worker_options, tx)) => {
-                                worker_pool.create_user_worker(worker_options, tx, termination_token.as_ref().map(|it| it.child_token()));
+                                worker_pool.create_user_worker(WorkerContextInitOpts {
+                                    static_patterns: static_patterns.clone(),
+                                    maybe_jsx_import_source_config: {
+                                        if worker_options.maybe_jsx_import_source_config.is_some() {
+                                            worker_options.maybe_jsx_import_source_config
+                                        } else {
+                                            jsx.clone()
+                                        }
+                                    },
+                                    ..worker_options
+                                }, tx, termination_token.as_ref().map(|it| it.child_token()));
                             }
+
                             Some(UserWorkerMsgs::Created(key, profile)) => {
                                 worker_pool.add_user_worker(key, profile);
                             }
-                            Some(UserWorkerMsgs::SendRequest(key, req, res_tx, conn_watch)) => {
-                                worker_pool.send_request(&key, req, res_tx, conn_watch);
+
+                            Some(UserWorkerMsgs::SendRequest(key, req, res_tx, conn_token)) => {
+                                worker_pool.send_request(&key, req, res_tx, conn_token);
                             }
+
                             Some(UserWorkerMsgs::Idle(key)) => {
                                 worker_pool.idle(&key);
                             }
+
                             Some(UserWorkerMsgs::Shutdown(key)) => {
                                 worker_pool.shutdown(&key);
 
-                                if let Some(token) = token {
-                                    if token.inbound.is_cancelled() && worker_pool.user_workers.is_empty() {
+                                if termination_requested && worker_pool.user_workers.is_empty() {
+                                    if let Some(token) = token {
                                         token.outbound.cancel();
                                     }
+
+                                    break;
                                 }
                             }
                         }

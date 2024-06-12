@@ -50,7 +50,7 @@ jobs:
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
       - id: build
         uses: docker/build-push-action@v3
@@ -86,7 +86,7 @@ jobs:
         uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
       - uses: docker/setup-buildx-action@v2
         with:
@@ -119,23 +119,13 @@ jobs:
       - uses: docker/login-action@v2
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_PASSWORD }}
+          password: ${{ secrets.DOCKER_TOKEN }}
 
       - name: Merge multi-arch manifests
         run: |
           docker buildx imagetools create -t khulnasoft/edge-runtime:v${{ needs.release.outputs.version }} \
           khulnasoft/edge-runtime@${{ needs.publish_x86.outputs.image_digest }} \
           khulnasoft/edge-runtime@${{ needs.publish_arm.outputs.image_digest }}
-      - name: configure aws credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          role-to-assume: ${{ secrets.PROD_AWS_ROLE }}
-          aws-region: us-east-1
-
-      - name: Login to ECR
-        uses: docker/login-action@v2
-        with:
-          registry: public.ecr.aws
 
       - name: Login to GHCR
         uses: docker/login-action@v2

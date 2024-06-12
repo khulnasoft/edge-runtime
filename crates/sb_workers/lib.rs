@@ -7,15 +7,16 @@ use crate::context::{
 };
 use anyhow::Error;
 use context::SendRequestResult;
+use deno_config::JsxImportSourceConfig;
 use deno_core::error::{custom_error, type_error, AnyError};
 use deno_core::futures::stream::Peekable;
 use deno_core::futures::{FutureExt, Stream, StreamExt};
-use deno_core::op2;
+use deno_core::{op2, ModuleSpecifier};
 use deno_core::{
     AsyncRefCell, AsyncResult, BufView, ByteString, CancelFuture, CancelHandle, CancelTryFuture,
     JsBuffer, OpState, RcRef, Resource, ResourceId, WriteOutcome,
 };
-use deno_http::{HttpRequestReader, HttpStreamResource};
+use deno_http::{HttpRequestReader, HttpStreamReadResource};
 use errors::WorkerError;
 use http_utils::utils::get_upgrade_type;
 use hyper::body::HttpBody;
@@ -23,17 +24,17 @@ use hyper::header::{HeaderName, HeaderValue, CONTENT_LENGTH};
 use hyper::upgrade::OnUpgrade;
 use hyper::{Body, Method, Request};
 use log::error;
-use sb_core::conn_sync::{ConnSync, ConnWatcher};
-use sb_graph::EszipPayloadKind;
+use sb_core::conn_sync::ConnWatcher;
+use sb_graph::{DecoratorType, EszipPayloadKind};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 deno_core::extension!(
@@ -47,7 +48,15 @@ deno_core::extension!(
     esm = ["user_workers.js",]
 );
 
-#[derive(Deserialize, Default, Debug)]
+#[derive(Deserialize, Serialize, Default, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct JsxImportBaseConfig {
+    default_specifier: Option<String>,
+    module: String,
+    base_url: String,
+}
+
+#[derive(Deserialize, Serialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UserWorkerCreateOptions {
     service_path: String,
@@ -67,6 +76,9 @@ pub struct UserWorkerCreateOptions {
     worker_timeout_ms: u64,
     cpu_time_soft_limit_ms: u64,
     cpu_time_hard_limit_ms: u64,
+
+    jsx_import_source_config: Option<JsxImportBaseConfig>,
+    decorator_type: Option<DecoratorType>,
 }
 
 #[op2(async)]
@@ -98,12 +110,30 @@ pub async fn op_user_worker_create(
             worker_timeout_ms,
             cpu_time_soft_limit_ms,
             cpu_time_hard_limit_ms,
+            jsx_import_source_config,
+            decorator_type: maybe_decorator,
         } = opts;
 
         let mut env_vars_map = HashMap::new();
         for (key, value) in env_vars {
             env_vars_map.insert(key, value);
         }
+
+        let jsx_import_conf = {
+            if let Some(jsx_import_source_config) = jsx_import_source_config {
+                Some(JsxImportSourceConfig {
+                    default_specifier: jsx_import_source_config.default_specifier,
+                    default_types_specifier: None,
+                    module: jsx_import_source_config.module,
+                    base_url: {
+                        let main = op_state.borrow::<ModuleSpecifier>().to_string();
+                        deno_core::resolve_url_or_path(&main, std::env::current_dir()?.as_path())?
+                    },
+                })
+            } else {
+                None
+            }
+        };
 
         let user_worker_options = WorkerContextInitOpts {
             service_path: PathBuf::from(service_path),
@@ -115,6 +145,7 @@ pub async fn op_user_worker_create(
             maybe_eszip: maybe_eszip.map(EszipPayloadKind::JsBufferKind),
             maybe_entrypoint,
             maybe_module_code: maybe_module_code.map(|v| v.into()),
+            maybe_decorator,
             conf: WorkerRuntimeOpts::UserWorker(UserWorkerRuntimeOpts {
                 memory_limit_mb,
                 low_memory_multiplier,
@@ -131,6 +162,8 @@ pub async fn op_user_worker_create(
                 cancel: None,
                 service_path: None,
             }),
+            static_patterns: vec![],
+            maybe_jsx_import_source_config: jsx_import_conf,
         };
 
         tx.send(UserWorkerMsgs::Create(user_worker_options, result_tx))?;
@@ -182,7 +215,7 @@ pub struct UserWorkerResponse {
 struct UserWorkerRequestResource(Request<Body>);
 
 impl Resource for UserWorkerRequestResource {
-    fn name(&self) -> Cow<str> {
+    fn name(&self) -> std::borrow::Cow<str> {
         "userWorkerRequest".into()
     }
 }
@@ -193,7 +226,7 @@ struct UserWorkerRequestBodyResource {
 }
 
 impl Resource for UserWorkerRequestBodyResource {
-    fn name(&self) -> Cow<str> {
+    fn name(&self) -> std::borrow::Cow<str> {
         "userWorkerRequestBody".into()
     }
 
@@ -211,7 +244,7 @@ impl Resource for UserWorkerRequestBodyResource {
             body.send(Ok(bytes))
                 .or_cancel(cancel)
                 .await?
-                .map_err(|_| type_error("request body receiver not connected (request closed)"))?;
+                .map_err(|e| type_error(format!("request body receiver not connected ({})", e)))?;
 
             Ok(WriteOutcome::Full { nwritten })
         })
@@ -249,14 +282,14 @@ type BytesStream = Pin<Box<dyn Stream<Item = Result<bytes::Bytes, std::io::Error
 
 struct UserWorkerResponseBodyResource {
     reader: AsyncRefCell<Peekable<BytesStream>>,
-    cancel: CancelHandle,
     size: Option<u64>,
     req_end_tx: mpsc::UnboundedSender<()>,
-    conn_watch: Option<watch::Receiver<ConnSync>>,
+    cancel: CancelHandle,
+    conn_token: Option<CancellationToken>,
 }
 
 impl Resource for UserWorkerResponseBodyResource {
-    fn name(&self) -> Cow<str> {
+    fn name(&self) -> std::borrow::Cow<str> {
         "userWorkerResponseBody".into()
     }
 
@@ -302,14 +335,8 @@ impl Resource for UserWorkerResponseBodyResource {
         };
 
         tokio::spawn(async move {
-            if let Some(mut watch) = this.conn_watch.clone() {
-                match watch.wait_for(|it| *it == ConnSync::Recv).await {
-                    Ok(_) => {}
-                    Err(ex) => error!(
-                        "error while waiting for the outbound connection to be finished: {}",
-                        ex.to_string()
-                    ),
-                }
+            if let Some(token) = this.conn_token {
+                token.cancelled_owned().await;
             }
         });
     }
@@ -375,6 +402,7 @@ pub async fn op_user_worker_fetch_send(
     state: Rc<RefCell<OpState>>,
     #[string] key: String,
     #[smi] rid: ResourceId,
+    #[smi] request_body_rid: Option<ResourceId>,
     #[smi] stream_rid: ResourceId,
     #[smi] watcher_rid: Option<ResourceId>,
 ) -> Result<UserWorkerResponse, AnyError> {
@@ -400,7 +428,7 @@ pub async fn op_user_worker_fetch_send(
             let req_stream = state
                 .borrow_mut()
                 .resource_table
-                .get::<HttpStreamResource>(stream_rid)?;
+                .get::<HttpStreamReadResource>(stream_rid)?;
 
             let mut req_reader_mut = RcRef::map(&req_stream, |r| &r.rd).borrow_mut().await;
 
@@ -417,7 +445,7 @@ pub async fn op_user_worker_fetch_send(
     let (result_tx, result_rx) = oneshot::channel::<Result<SendRequestResult, Error>>();
     let key_parsed = Uuid::try_parse(key.as_str())?;
 
-    let watcher = watcher_rid
+    let conn_token = watcher_rid
         .and_then(|it| {
             state
                 .borrow_mut()
@@ -427,7 +455,7 @@ pub async fn op_user_worker_fetch_send(
         })
         .map(Rc::try_unwrap);
 
-    let watcher = match watcher {
+    let conn_token = match conn_token {
         Some(Ok(it)) => it.get(),
         Some(Err(_)) => {
             error!("failed to unwrap connection watcher");
@@ -441,28 +469,43 @@ pub async fn op_user_worker_fetch_send(
         key_parsed,
         req.0,
         result_tx,
-        watcher.clone(),
+        conn_token.clone(),
     ))?;
+
+    let request_body_guard = scopeguard::guard(request_body_rid, |rid| {
+        if let Some(rid) = rid {
+            match state
+                .borrow()
+                .resource_table
+                .get::<UserWorkerRequestBodyResource>(rid)
+            {
+                Err(_) => {}
+                Ok(res) => {
+                    res.cancel.cancel();
+                }
+            }
+        }
+    });
 
     let res = result_rx.await?;
     let (res, req_end_tx) = match res {
         Ok((res, req_end_tx)) => (res, req_end_tx),
         Err(err) => {
             error!("user worker failed to respond: {}", err);
+
             match err.downcast_ref() {
                 Some(err @ WorkerError::RequestCancelledBySupervisor) => {
                     return Err(custom_error("WorkerRequestCancelled", err.to_string()));
                 }
 
                 None => {
-                    return Err(custom_error(
-                        "InvalidWorkerResponse",
-                        "user worker failed to respond",
-                    ));
+                    return Err(custom_error("InvalidWorkerResponse", err.to_string()));
                 }
             }
         }
     };
+
+    drop(request_body_guard);
 
     let mut headers = vec![];
     for (key, value) in res.headers().iter() {
@@ -492,7 +535,7 @@ pub async fn op_user_worker_fetch_send(
         cancel: CancelHandle::default(),
         size,
         req_end_tx,
-        conn_watch: watcher,
+        conn_token,
     });
 
     let response = UserWorkerResponse {
