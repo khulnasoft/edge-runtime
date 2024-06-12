@@ -25,5 +25,4 @@ jobs:
         with:
           src: docker.io/khulnasoft/edge-runtime:${{ inputs.version }}
           dst: |
-            public.ecr.aws/khulnasoft/edge-runtime:${{ inputs.version }}
             ghcr.io/khulnasoft/edge-runtime:${{ inputs.version }}
