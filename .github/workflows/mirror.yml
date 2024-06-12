@@ -18,9 +18,6 @@ jobs:
     steps:
       - uses: docker/login-action@v2
         with:
-          registry: public.ecr.aws
-      - uses: docker/login-action@v2
-        with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
